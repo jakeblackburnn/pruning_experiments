@@ -24,14 +24,15 @@ SIGNIFICANT = 0.05
 
 
 def git_commit(root):
-    """Short HEAD hash, suffixed -dirty if the tree has uncommitted changes."""
+    """Short HEAD hash, suffixed -dirty if tracked files have uncommitted
+    changes (untracked results/ being written by the run don't count)."""
     def git(*args):
         return subprocess.run(["git", *args], cwd=root, capture_output=True,
                               text=True).stdout.strip()
     head = git("rev-parse", "--short", "HEAD")
     if not head:
         return None
-    return head + ("-dirty" if git("status", "--porcelain") else "")
+    return head + ("-dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
 
 
 # --------------------------------------------------------------------------
