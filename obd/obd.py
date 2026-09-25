@@ -1,5 +1,5 @@
 """Optimal Brain Damage — LeCun, Denker & Solla (NIPS 1989), reproduced,
-plus a modern CIFAR-10 counterpart. See README.md for the story.
+plus a modern CIFAR-10 counterpart. See RESULTS.md and obd.ipynb for the story.
 
 Core calculations only: experiment configs, device selection, model
 definitions, the training step, the diagonal-Hessian / OBD-saliency math, and

@@ -1,28 +1,47 @@
 """Optimal Brain Damage — LeCun, Denker & Solla (NIPS 1989), reproduced,
-plus a modern CIFAR-10 counterpart. See README.md for the story.
+plus a modern CIFAR-10 counterpart. Results: RESULTS.md; walkthrough: obd.ipynb.
 
-Stages (each caches its output, so later stages can be rerun alone):
+    python3 main.py                  the whole suite, both datasets, in one go:
+                                     train -> prune -> plot (per dataset), then
+                                     report -> notebook
 
-    python3 main.py --train    train the base network -> checkpoints/<name>.pt
-    python3 main.py --prune    run pruning experiments -> results/<name>.json
-    python3 main.py --plot     draw the figures        -> figures/*.png
-    python3 main.py            all of the above
+Stages (each caches its output, so any one can be rerun alone):
 
-Experiments (default: digits, the paper's setup):
+    --train      train the base network   -> checkpoints/<name>.pt
+    --prune      run pruning experiments  -> results/<name>.json
+    --plot       draw the figures         -> figures/*_<name>.png
+    --report     rewrite the generated blocks in RESULTS.md and ../README.md
+    --notebook   execute obd.ipynb in place
 
-    python3 main.py --dataset digits    1989 net, 16x16 digits, MSE
-    python3 main.py --dataset cifar     VGG-style net, CIFAR-10, cross-entropy
+Datasets (default: both):
 
-The device is chosen automatically (Metal, else CUDA, else CPU) and can be
-pinned with `--set device=cpu`. The prune stage can rerun a subset of its
-experiments (merged into the existing results file), and any Experiment field
-can be overridden:
+    --dataset digits    the paper: 1989 zip-code net, 16x16 digits, MSE
+    --dataset cifar     VGG-style ReLU net (~590k params), CIFAR-10, cross-entropy
 
-    python3 main.py --only retrain_magnitude       just the magnitude control
-    python3 main.py --dataset cifar --set epochs=5 lr=3e-4
+The prune stage's experiments can be rerun individually with --only (implies
+--prune); they merge into the cached results file:
+
+    magnitude                       delete smallest-|w| first, no retraining
+    saliency, saliency_recomputed   same, ranked by OBD saliency, once / re-ranked each step
+    saliency_layermean[_recomputed] ranked by 1/2 * mean_layer(h) * w^2, the control between the two
+    retrain, retrain_magnitude      the prune-retrain loop, and its magnitude-ranked control
+    overlap                         the ranking-agreement analysis behind Figs 5-7
+
+Any Experiment field (obd.py) can be overridden, typed against its default:
+
+    python3 main.py --dataset cifar --set epochs=5 lr=3e-4 hessian_samples=1024
+    python3 main.py --dataset digits --only retrain_magnitude
+
+The device is chosen automatically (Metal, else CUDA, else CPU). Pin it with
+--set device=cpu, which is often *faster* for digits: at 8.8k parameters and
+batch 32, kernel-launch overhead dominates. Each results file's _meta records
+the config, checkpoint hash, git commit and per-experiment durations, and a
+stale merge gets a warning rather than silence. A crashed run is resumed by
+rerunning the stage that failed; nothing is skipped automatically.
 
 Orchestration only: disk I/O, the experiment runner, and the CLI. The OBD math
-lives in obd.py, the experiments in experiments.py, plotting in figures.py.
+lives in obd.py, the experiments in experiments.py, plotting in figures.py,
+the result briefs in report.py.
 """
 
 import argparse
@@ -30,10 +49,12 @@ import dataclasses
 import datetime
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import torch
 
+import report
 from datasets import load
 from experiments import PRUNE_EXPERIMENTS
 from figures import FIGURES
@@ -43,6 +64,8 @@ ROOT = Path(__file__).parent
 CHECKPOINT_DIR = ROOT / "checkpoints"
 RESULTS_DIR = ROOT / "results"
 FIGURES_DIR = ROOT / "figures"
+NOTEBOOK = ROOT / "obd.ipynb"
+BRIEFS = (ROOT / "RESULTS.md", ROOT.parent / "README.md")
 
 
 def checkpoint_path(exp):
@@ -84,8 +107,9 @@ def load_base_model(exp):
     return model.to(exp.device)
 
 
-def _meta(exp):
-    """Provenance for a results file: which config and which checkpoint.
+def _meta(exp, durations):
+    """Provenance for a results file: which config, checkpoint and commit,
+    and how long each experiment took.
 
     Without this a partial rerun silently merges results from two different
     base models into one file, and nothing downstream can tell.
@@ -94,6 +118,7 @@ def _meta(exp):
     digest = (hashlib.sha1(path.read_bytes()).hexdigest()[:12] if path.exists()
               else None)
     return {"config": dataclasses.asdict(exp), "checkpoint_sha1": digest,
+            "git_commit": report.git_commit(ROOT), "durations_s": durations,
             "torch": torch.__version__,
             "written": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
 
@@ -140,12 +165,15 @@ def run_experiments(exp, only=None):
     if out:
         check_meta(exp, out)
 
+    durations = dict(out.get("_meta", {}).get("durations_s") or {})
     for key in keys:
         print(f"[{exp.name}] {key}...")
         torch.manual_seed(SEED)
+        start = time.perf_counter()
         out[key] = PRUNE_EXPERIMENTS[key](model, splits, exp)
+        durations[key] = round(time.perf_counter() - start, 1)
 
-    out["_meta"] = _meta(exp)
+    out["_meta"] = _meta(exp, durations)
     path.write_text(json.dumps(out, indent=2))
     print(f"saved {path}")
     return out
@@ -176,6 +204,19 @@ def make_all_figures(exp, results=None, save=True):
             fig.savefig(path, bbox_inches="tight")
             print(f"saved {path}")
     return drawn
+
+
+def make_report(names):
+    """Rewrite the generated blocks of every brief from the cached results.
+    Datasets without results are listed as not yet run."""
+    results = {}
+    for name in names:
+        path = RESULTS_DIR / f"{name}.json"
+        if path.exists():
+            results[name] = json.loads(path.read_text())
+        else:
+            print(f"  note: no {path} yet — its rows will be missing")
+    report.write_all(BRIEFS, report.render(results))
 
 
 # --------------------------------------------------------------------------
@@ -218,8 +259,11 @@ def main():
     parser.add_argument("--train", action="store_true", help="train the base model")
     parser.add_argument("--prune", action="store_true", help="run the pruning experiments")
     parser.add_argument("--plot", action="store_true", help="generate the figures")
-    parser.add_argument("--dataset", choices=sorted(EXPERIMENTS),
-                        default="digits", help="which experiment to run")
+    parser.add_argument("--report", action="store_true",
+                        help="rewrite the generated blocks in RESULTS.md and ../README.md")
+    parser.add_argument("--notebook", action="store_true", help="execute obd.ipynb in place")
+    parser.add_argument("--dataset", nargs="+", choices=list(EXPERIMENTS),
+                        default=list(EXPERIMENTS), help="which experiments to run (default: all)")
     parser.add_argument("--only", nargs="+", choices=list(PRUNE_EXPERIMENTS),
                         help="prune stage: run only these experiments and merge "
                              "them into the existing results/<name>.json")
@@ -227,18 +271,37 @@ def main():
                         help="override Experiment fields, e.g. --set epochs=5 lr=3e-4")
     args = parser.parse_args()
 
-    exp = configure(args.dataset, args.set)
-    print(f"[{exp.name}] device: {exp.device}")
-
     if args.only:
         args.prune = True  # --only alone means: run just those prune experiments
-    run_all = not (args.train or args.prune or args.plot)
-    if args.train or run_all:
-        train_base_model(exp)
-    if args.prune or run_all:
-        run_experiments(exp, only=args.only)
-    if args.plot or run_all:
-        make_all_figures(exp)
+    run_all = not (args.train or args.prune or args.plot or args.report or args.notebook)
+    try:  # every override is parsed and type-checked before the first stage starts
+        exps = [configure(name, args.set) for name in args.dataset]
+    except ValueError as err:
+        parser.error(str(err))
+    timings = []
+
+    def timed(label, fn, *fn_args, **fn_kwargs):
+        start = time.perf_counter()
+        fn(*fn_args, **fn_kwargs)
+        timings.append((label, time.perf_counter() - start))
+
+    for exp in exps:
+        print(f"[{exp.name}] device: {exp.device}")
+        if args.train or run_all:
+            timed(f"{exp.name} train", train_base_model, exp)
+        if args.prune or run_all:
+            timed(f"{exp.name} prune", run_experiments, exp, only=args.only)
+        if args.plot or run_all:
+            timed(f"{exp.name} plot", make_all_figures, exp)
+    if args.report or run_all:
+        timed("report", make_report, list(EXPERIMENTS))
+    if args.notebook or run_all:
+        timed("notebook", report.execute_notebook, NOTEBOOK)
+
+    if timings:
+        print("\ntimings:")
+        for label, seconds in timings:
+            print(f"  {label:<16} {report.minutes(seconds)}")
 
 
 if __name__ == "__main__":

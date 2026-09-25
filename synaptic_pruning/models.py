@@ -1,7 +1,7 @@
 """Two sequence forecasters, matching two of the paper's three architectures
 (RNN, LSTM — PatchTST is a heavier transformer variant the paper also ran;
 skipped here since the M4's Metal backend and this dataset's scale don't
-need it to test the paper's claim, see README). Both: a recurrent encoder
+need it to test the paper's claim, see RESULTS.md, Scope). Both: a recurrent encoder
 over the input window, dropout on the last hidden state, a linear head
 predicting the next value.
 

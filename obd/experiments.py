@@ -151,7 +151,7 @@ def iterative_prune_retrain(model, splits, exp, rank_by="saliency"):
 #                           / (sigma_w sqrt(4 sigma_w^2 + sigma_h^2 + 4 sigma_hw))
 #
 # The two rankings agree closely when sigma_h << 2 sigma_w, and positive
-# covariance (which weight decay induces - see README) pushes agreement higher
+# covariance (which weight decay induces - see obd.ipynb §6) pushes agreement higher
 # still. `between_layer_frac` then asks where sigma_h^2 comes from: if most of
 # it is differences between layer means rather than spread within a layer,
 # the curvature term acts as a per-layer offset, and OBD's only real advantage

@@ -98,7 +98,7 @@ def split_train_test(x, y, test_frac=0.2):
 
 class Standardizer:
     """Per-feature z-score, fit on train only. MAE is reported in these
-    standardized units throughout (see README) so that numbers are
+    standardized units throughout (see RESULTS.md, Scope) so that numbers are
     comparable across dataset-size and sequence-length settings, where the
     raw CO(GT) scale doesn't change but the train-set statistics used to fit
     the standardizer do."""

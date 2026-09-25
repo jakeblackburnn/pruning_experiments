@@ -156,6 +156,10 @@ def fig_bitter_lesson_ladder(results):
     bl = results.get("bitter_lesson")
     if bl is None:
         return None
+    if not bl["cells"] or "tier_index" not in bl["cells"][0]:
+        print("  note: results/bitter_lesson.json is from the old 3x3x3 grid — "
+              "rerun `python3 main.py --bitter-lesson` for the ladder figure")
+        return None
     plt.rcParams.update(STYLE)
     cells = sorted(bl["cells"], key=lambda c: c["tier_index"])
     labels = [f"h={c['hidden_size']}\ne={c['epochs']}\nn={c['n_rows']}" for c in cells]
