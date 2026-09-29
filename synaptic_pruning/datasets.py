@@ -1,140 +1,152 @@
-"""The UCI Air Quality dataset — hourly gas-sensor and weather readings from
-a polluted street in an Italian city, March 2004 - February 2005 (De Vito et
-al. 2008). One of the four datasets in Vos et al. 2025 ("high complexity",
-9446 records): 13 sensor/weather channels at 1-hour resolution, with a
-seasonal + diurnal structure that gives a sequence model something real to
-predict, unlike a nearly-i.i.d. series.
+"""Hourly multivariate time series for one-step-ahead forecasting.
 
-Downloaded straight from UCI's static archive (no key, no anti-bot
-challenge — unlike the paper's other three sources, which sit behind
-Kaggle logins or a JS proof-of-work wall on the download CDN we tried).
+    load(dataset, seq_len, train_frac, n_cap) -> Splits
 
-Task: given the last `seq_len` hours of all 12 usable channels, predict the
-next hour's CO(GT) concentration (mg/m^3) — a standard framing for this
-dataset. `n_rows` (tail-truncate before windowing) is the dataset-size knob
-for the bitter-lesson grid.
+Task: given the last `seq_len` rows of every channel (the target's own history
+included), predict the next row's target. MAE is in standardized units, so it
+is comparable across settings.
+
+No dataset is downloaded by hand: each is fetched on first use from a static
+URL (no key, no login) into data/ (git-ignored).
+
+    air_quality   UCI Air Quality, target CO(GT), ~9.3k hourly rows
+    beijing_pm25  UCI Beijing PM2.5, target pm2.5, ~43.8k hourly rows
+    etth1         ETTh1 (electricity transformer), target OT, ~17.4k hourly rows
+
+Splits are chronological by row: the first 70% is train, the next 10% is
+validation, the last 20% is test. Windows are cut inside each segment, so no
+row is shared by two segments' windows: there is no train/test leakage. Missing
+values are forward-filled (causal; leading rows without a value are dropped),
+and features and target are z-scored with statistics of the full train segment.
+`train_frac` keeps only the most recent part of the train segment (the
+data-size axis), while validation and test stay fixed, so every data size is
+scored on the same targets in the same units.
 """
 
-import functools
 import io
 import urllib.request
 import zipfile
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).parent
-DATA_DIR = ROOT / "data"
-CSV_PATH = DATA_DIR / "AirQualityUCI.csv"
-URL = "https://archive.ics.uci.edu/static/public/360/air+quality.zip"
+DATA_DIR = Path(__file__).parent / "data"
+SPLITS = (0.7, 0.1, 0.2)   # train / val / test, by row
 
-# NMHC(GT) is -200 (missing) for ~90% of rows past the first two months —
-# unusable as a feature. Date/Time become the index. Everything else is a
-# feature; CO(GT) doubles as the forecast target.
-DROP_COLUMNS = ["NMHC(GT)"]
-TARGET_COLUMN = "CO(GT)"
-MISSING_SENTINEL = -200.0
+UCI = "https://archive.ics.uci.edu/static/public/{id}/{slug}.zip"
+ETT = "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTh1.csv"
 
 
-def download():
-    """Fetch and cache the raw CSV. No-op if already on disk."""
-    if CSV_PATH.exists():
-        return CSV_PATH
+def _fetch(url, name, member=None):
+    """Download `url` (unzipping `member` if given) into data/<name>, once."""
+    path = DATA_DIR / name
+    if path.exists():
+        return path
     DATA_DIR.mkdir(exist_ok=True)
-    print(f"downloading {URL} ...")
-    with urllib.request.urlopen(URL, timeout=30) as resp:
+    print(f"downloading {url} ...")
+    with urllib.request.urlopen(url, timeout=60) as resp:
         blob = resp.read()
-    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
-        with zf.open("AirQualityUCI.csv") as f, open(CSV_PATH, "wb") as out:
-            out.write(f.read())
-    print(f"saved {CSV_PATH}")
-    return CSV_PATH
+    if member:
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf, zf.open(member) as f:
+            blob = f.read()
+    path.write_bytes(blob)
+    return path
 
 
-@functools.lru_cache(maxsize=1)
-def load_frame():
-    """The cleaned, hourly-indexed DataFrame: missing sentinels interpolated,
-    empty trailing columns and NMHC(GT) dropped, sorted by time. Cached —
-    both experiment grids call this once per (seq_len, n_rows) combination."""
-    path = download()
+def _air_quality():
+    path = _fetch(UCI.format(id=360, slug="air+quality"), "AirQualityUCI.csv",
+                  "AirQualityUCI.csv")
     df = pd.read_csv(path, sep=";", decimal=",")
     df = df.drop(columns=[c for c in df.columns if c.startswith("Unnamed") or c == ""])
     df = df.dropna(how="all")
-    df["timestamp"] = pd.to_datetime(df["Date"] + " " + df["Time"],
-                                      format="%d/%m/%Y %H.%M.%S")
-    df = df.drop(columns=["Date", "Time"] + DROP_COLUMNS).set_index("timestamp").sort_index()
-    df = df.replace(MISSING_SENTINEL, np.nan)
-    df = df.interpolate(method="linear", limit_direction="both")
-    return df
+    df["timestamp"] = pd.to_datetime(df["Date"] + " " + df["Time"], format="%d/%m/%Y %H.%M.%S")
+    # NMHC(GT) is missing for ~90% of rows past the first two months
+    df = df.drop(columns=["Date", "Time", "NMHC(GT)"]).set_index("timestamp").sort_index()
+    return df.replace(-200.0, np.nan), "CO(GT)"
 
 
-def feature_columns(df):
-    return [c for c in df.columns if c != TARGET_COLUMN]
+def _beijing_pm25():
+    path = _fetch(UCI.format(id=381, slug="beijing+pm2+5+data"),
+                  "PRSA_data_2010.1.1-2014.12.31.csv", "PRSA_data_2010.1.1-2014.12.31.csv")
+    df = pd.read_csv(path)
+    df["timestamp"] = pd.to_datetime(df[["year", "month", "day", "hour"]])
+    df = df.drop(columns=["No", "year", "month", "day", "hour"]).set_index("timestamp")
+    df = pd.concat([df.drop(columns="cbwd"),
+                    pd.get_dummies(df["cbwd"], prefix="wind", dtype=float)], axis=1)
+    return df.sort_index(), "pm2.5"
 
 
-def make_windows(df, seq_len, n_rows=None):
-    """Sliding windows: X[i] = the seq_len rows before i (all features),
-    y[i] = TARGET_COLUMN at row i. n_rows keeps only the most recent n_rows
-    of the frame before windowing (the dataset-size knob)."""
-    if n_rows is not None:
-        df = df.tail(n_rows)
-    cols = feature_columns(df)
-    features = df[cols].to_numpy(dtype=np.float32)
-    target = df[TARGET_COLUMN].to_numpy(dtype=np.float32)
-    n = len(df) - seq_len
+def _etth1():
+    path = _fetch(ETT, "ETTh1.csv")
+    df = pd.read_csv(path, parse_dates=["date"]).set_index("date").sort_index()
+    return df, "OT"
+
+
+LOADERS = {"air_quality": _air_quality, "beijing_pm25": _beijing_pm25, "etth1": _etth1}
+DATASETS = tuple(LOADERS)
+
+
+@lru_cache(maxsize=None)
+def frame(dataset):
+    """(features DataFrame with the target as one column, target name), causally
+    cleaned: forward-filled, with leading rows that still have gaps dropped."""
+    df, target = LOADERS[dataset]()
+    df = df.ffill().dropna()
+    return df, target
+
+
+@dataclass
+class Splits:
+    train: tuple          # (x, y) float32 arrays: x (n, seq_len, n_features), y (n,)
+    val: tuple
+    test: tuple
+    persistence: dict     # {"val": mae, "test": mae} of predicting the last observed target
+    n_features: int
+    n_train_rows: int     # rows in the (possibly truncated) train segment
+
+
+def _windows(values, target_idx, seq_len):
+    """x[i] = rows i..i+seq_len-1, y[i] = target of row i+seq_len."""
+    n = len(values) - seq_len
     if n <= 0:
-        raise ValueError(f"n_rows={n_rows} too small for seq_len={seq_len}")
-    x = np.stack([features[i:i + seq_len] for i in range(n)])
-    y = target[seq_len:seq_len + n]
-    return x, y
+        raise ValueError(f"segment of {len(values)} rows is too short for seq_len={seq_len}")
+    view = np.lib.stride_tricks.sliding_window_view(values, seq_len, axis=0)[:n]
+    x = np.ascontiguousarray(view.transpose(0, 2, 1))
+    return x, values[seq_len:seq_len + n, target_idx], values[seq_len - 1:seq_len - 1 + n, target_idx]
 
 
-def split_train_test(x, y, test_frac=0.2):
-    """Chronological split — the last test_frac of windows held out."""
-    n_test = max(1, int(len(x) * test_frac))
-    return (x[:-n_test], y[:-n_test]), (x[-n_test:], y[-n_test:])
+@lru_cache(maxsize=None)
+def load(dataset, seq_len, train_frac=1.0, n_cap=None):
+    df, target = frame(dataset)
+    values = df.to_numpy(dtype=np.float64)
+    target_idx = list(df.columns).index(target)
+    n = len(values)
+    a, b = round(SPLITS[0] * n), round((SPLITS[0] + SPLITS[1]) * n)
+    train_seg, val_seg, test_seg = values[:a], values[a:b], values[b:]
 
+    mean, std = train_seg.mean(axis=0), train_seg.std(axis=0) + 1e-8
+    train_seg, val_seg, test_seg = ((s - mean) / std for s in (train_seg, val_seg, test_seg))
 
-class Standardizer:
-    """Per-feature z-score, fit on train only. MAE is reported in these
-    standardized units throughout (see RESULTS.md, Scope) so that numbers are
-    comparable across dataset-size and sequence-length settings, where the
-    raw CO(GT) scale doesn't change but the train-set statistics used to fit
-    the standardizer do."""
+    keep = max(seq_len + 2, int(round(train_frac * len(train_seg))))
+    train_seg = train_seg[-keep:]
+    if n_cap is not None:   # tiny runs (smoke tests)
+        train_seg, val_seg, test_seg = (s[-(n_cap + seq_len):] for s in (train_seg, val_seg, test_seg))
 
-    def __init__(self, x):
-        axes = tuple(range(x.ndim - 1))  # everything but the feature axis
-        self.mean = x.mean(axis=axes, keepdims=True)
-        self.std = x.std(axis=axes, keepdims=True) + 1e-8
-
-    def transform(self, x):
-        return (x - self.mean) / self.std
-
-
-def load(seq_len, n_rows=None, test_frac=0.2):
-    """(x_train, y_train, x_test, y_test) as float32 arrays, features and
-    target both standardized on train statistics. Shapes: x is
-    (n, seq_len, n_features), y is (n,)."""
-    df = load_frame()
-    x, y = make_windows(df, seq_len, n_rows=n_rows)
-    (x_tr, y_tr), (x_te, y_te) = split_train_test(x, y, test_frac=test_frac)
-
-    xs = Standardizer(x_tr)
-    ys = Standardizer(y_tr[:, None])
-    x_tr, x_te = xs.transform(x_tr), xs.transform(x_te)
-    y_tr = ys.transform(y_tr[:, None])[:, 0]
-    y_te = ys.transform(y_te[:, None])[:, 0]
-    return x_tr, y_tr, x_te, y_te
-
-
-def n_features():
-    return len(feature_columns(load_frame()))
+    out, persistence = {}, {}
+    for name, seg in (("train", train_seg), ("val", val_seg), ("test", test_seg)):
+        x, y, last = _windows(seg, target_idx, seq_len)
+        out[name] = (x.astype(np.float32), y.astype(np.float32))
+        persistence[name] = float(np.abs(y - last).mean())
+    return Splits(out["train"], out["val"], out["test"], persistence, values.shape[1], len(train_seg))
 
 
 if __name__ == "__main__":
-    df = load_frame()
-    print(f"{len(df)} hourly rows, {df.index.min()} .. {df.index.max()}")
-    print(f"features: {feature_columns(df)}")
-    x_tr, y_tr, x_te, y_te = load(seq_len=30)
-    print(f"seq_len=30: train {x_tr.shape}, test {x_te.shape}")
+    for name in DATASETS:
+        df, target = frame(name)
+        s = load(name, 14)
+        print(f"{name:13s} {len(df):6d} rows, {df.shape[1]} channels, target {target}; "
+              f"windows train/val/test {len(s.train[1])}/{len(s.val[1])}/{len(s.test[1])}; "
+              f"persistence MAE val {s.persistence['val']:.3f} test {s.persistence['test']:.3f}")

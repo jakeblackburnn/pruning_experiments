@@ -1,10 +1,9 @@
-"""Optimal Brain Damage — LeCun, Denker & Solla (NIPS 1989), reproduced,
-plus a modern CIFAR-10 counterpart. See RESULTS.md and obd.ipynb for the story.
+"""Optimal Brain Damage (LeCun, Denker & Solla, NIPS 1989) at modern scales.
 
-Core calculations only: experiment configs, device selection, model
+Core calculations only: the unit-of-work config, device selection, model
 definitions, the training step, the diagonal-Hessian / OBD-saliency math, and
-the pruning primitives. The pruning experiments themselves live in
-experiments.py, plotting in figures.py, and the CLI in main.py.
+the pruning primitives. Experiments live in experiments.py, the factorial
+design in design.py, the runner in main.py, analysis in aggregate.py.
 """
 
 from dataclasses import dataclass
@@ -16,58 +15,42 @@ from torch.func import functional_call, jacrev, vmap
 
 
 @dataclass(frozen=True)
-class Experiment:
-    name: str            # checkpoint / results / figure prefix
-    loss: str            # "mse" (paper setup) or "ce" (conventional)
-    device: str          # "auto" (see resolve_device) or an explicit torch device
-    epochs: int
-    lr: float
+class Unit:
+    """One unit of work: train a base network, then run every pruning
+    experiment on it. A unit is the smallest thing the runner schedules,
+    logs and resumes."""
+    dataset: str            # mnist | fmnist | cifar10 (datasets.DATASETS)
+    arch: str               # paper | mlp | vgg | resnet (ARCHS)
+    width: float            # channel / hidden-unit multiplier
+    data_frac: float        # fraction of the training pool used
+    epochs: int             # base training epochs
     weight_decay: float
-    batch_size: int
-    retrain_epochs: int  # retraining between pruning steps (Fig 4)
-    hessian_samples: int | None  # subsample for the diagonal Hessian (None = all)
-    sweep_points: int            # pruning levels in the no-retrain sweeps
-    sweep_min_remaining: int     # smallest weight count in the no-retrain sweep
-    retrain_min_remaining: int   # stop the prune-retrain loop below this
-    shrink: float                # fraction of weights kept per prune-retrain step
+    retrain_epochs: int     # retraining between pruning steps
+    seed: int
+    hessian_samples: int = 1024   # subsample for the diagonal Hessian
+    n_cap: int | None = None      # cap on training samples (smoke tests)
+    lr: float = 1e-3
+    batch_size: int | None = None  # None: 32 for the paper net, else 128
 
+    @property
+    def loss(self) -> str:
+        """The paper net trains tanh outputs to +-1 targets with MSE; the
+        modern nets use cross-entropy."""
+        return "mse" if self.arch == "paper" else "ce"
 
-# simple 1990 network, 16x16 digits, MSE (mirrors OBD paper) for MNIST
-# https://github.com/pytorch/vision/blob/master/torchvision/datasets/mnist.py
-DIGITS = Experiment(
-    name="digits", loss="mse", device="auto",
-    epochs=60, lr=1e-3, weight_decay=1e-3, batch_size=32,
-    retrain_epochs=4, hessian_samples=None, sweep_points=25,
-    sweep_min_remaining=50, retrain_min_remaining=100, shrink=0.8,
-)
-
-# VGG-style convnet for CIFAR-10
-# https://github.com/pytorch/vision/blob/master/torchvision/datasets/cifar.py
-CIFAR = Experiment(
-    name="cifar", loss="ce", device="auto",
-    epochs=30, lr=1e-3, weight_decay=1e-4, batch_size=128,
-    retrain_epochs=2, hessian_samples=2048, sweep_points=18,
-    sweep_min_remaining=3000, retrain_min_remaining=3000, shrink=0.7,
-)
-
-EXPERIMENTS = {e.name: e for e in (DIGITS, CIFAR)}
-
-SEED = 1989
+    @property
+    def batch(self) -> int:
+        return self.batch_size or (32 if self.arch == "paper" else 128)
 
 
 def resolve_device(prefer: str = "auto") -> str:
-    """Metal first, then CUDA, then CPU. An explicit name is honoured as-is.
-
-    The digits net is tiny (8.8k parameters at batch 32), so kernel-launch
-    overhead can make it *slower* on an accelerator than on the CPU — use
-    `--set device=cpu` if that is the case on your machine.
-    """
+    """CUDA first, then Metal, then CPU. An explicit name is honoured as-is."""
     if prefer != "auto":
         return prefer
-    if torch.backends.mps.is_available():
-        return "mps"
     if torch.cuda.is_available():
         return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
     return "cpu"
 
 
@@ -129,40 +112,95 @@ class MnistNet(nn.Module):
         return x
 
 
-class CifarNet(nn.Module):
-    """A conventional small VGG-style convnet for CIFAR-10 (~590k parameters).
+class MLP(nn.Module):
+    """Two hidden ReLU layers of 256*width units."""
 
-    ReLU units and a cross-entropy head - the modern counterpart to the
-    1989 network, for testing how OBD holds up beyond the paper's setup.
-    """
-
-    def __init__(self):
+    def __init__(self, in_channels, size, classes, width):
         super().__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
-        self.fc1 = nn.Linear(64 * 8 * 8, 128)
-        self.fc2 = nn.Linear(128, 10)
+        h = max(4, int(256 * width))
+        self.fc1 = nn.Linear(in_channels * size * size, h)
+        self.fc2 = nn.Linear(h, h)
+        self.fc3 = nn.Linear(h, classes)
+
+    def forward(self, x):
+        x = x.flatten(1)
+        return self.fc3(F.relu(self.fc2(F.relu(self.fc1(x)))))
+
+
+class VGG(nn.Module):
+    """A small VGG-style convnet (four 3x3 convs, two pools, two fc layers),
+    32*width / 64*width channels. ReLU units, logits out."""
+
+    def __init__(self, in_channels, size, classes, width):
+        super().__init__()
+        c1, c2, h = (max(4, int(c * width)) for c in (32, 64, 128))
+        self.conv1 = nn.Conv2d(in_channels, c1, 3, padding=1)
+        self.conv2 = nn.Conv2d(c1, c1, 3, padding=1)
+        self.conv3 = nn.Conv2d(c1, c2, 3, padding=1)
+        self.conv4 = nn.Conv2d(c2, c2, 3, padding=1)
+        self.fc1 = nn.Linear(c2 * 4 * 4, h)
+        self.fc2 = nn.Linear(h, classes)
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
         x = F.max_pool2d(F.relu(self.conv2(x)), 2)
         x = F.relu(self.conv3(x))
         x = F.max_pool2d(F.relu(self.conv4(x)), 2)
-        x = x.flatten(1)
-        x = F.relu(self.fc1(x))
-        return self.fc2(x)  # logits; cross-entropy applies the softmax
+        x = F.adaptive_avg_pool2d(x, 4).flatten(1)
+        return self.fc2(F.relu(self.fc1(x)))
 
 
-MODELS = {"digits": MnistNet, "cifar": CifarNet}
+class _Block(nn.Module):
+    def __init__(self, cin, cout, stride):
+        super().__init__()
+        self.conv1 = nn.Conv2d(cin, cout, 3, stride, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(cout)
+        self.conv2 = nn.Conv2d(cout, cout, 3, 1, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(cout)
+        self.short = None
+        if stride != 1 or cin != cout:
+            self.short = nn.Sequential(nn.Conv2d(cin, cout, 1, stride, bias=False),
+                                       nn.BatchNorm2d(cout))
+
+    def forward(self, x):
+        y = self.bn2(self.conv2(F.relu(self.bn1(self.conv1(x)))))
+        return F.relu(y + (x if self.short is None else self.short(x)))
 
 
-def build(exp):
-    if exp.name not in MODELS:
-        raise ValueError(f"no model for experiment {exp.name!r}; "
-                         f"choose from {sorted(MODELS)}")
-    return MODELS[exp.name]()
+class ResNet(nn.Module):
+    """A small ResNet with BatchNorm: a stem and three residual stages of one
+    block each, 32/64/128 * width channels. The BatchNorm arch is here to test
+    OBD's curvature pass on a net with normalisation (BN in eval mode)."""
+
+    def __init__(self, in_channels, size, classes, width):
+        super().__init__()
+        c1, c2, c3 = (max(4, int(c * width)) for c in (32, 64, 128))
+        self.stem = nn.Conv2d(in_channels, c1, 3, padding=1, bias=False)
+        self.bn = nn.BatchNorm2d(c1)
+        self.block1 = _Block(c1, c1, 1)
+        self.block2 = _Block(c1, c2, 2)
+        self.block3 = _Block(c2, c3, 2)
+        self.fc = nn.Linear(c3, classes)
+
+    def forward(self, x):
+        x = F.relu(self.bn(self.stem(x)))
+        x = self.block3(self.block2(self.block1(x)))
+        return self.fc(F.adaptive_avg_pool2d(x, 1).flatten(1))
+
+
+class _Paper(MnistNet):
+    def __init__(self, in_channels, size, classes, width):
+        assert (in_channels, size, classes) == (1, 16, 10) and width == 1.0, \
+            "the paper net is 16x16 digits at width 1 only"
+        super().__init__()
+
+
+ARCHS = {"paper": _Paper, "mlp": MLP, "vgg": VGG, "resnet": ResNet}
+
+
+def build(unit, info):
+    """The unit's network for a dataset described by datasets.Info."""
+    return ARCHS[unit.arch](info.channels, info.size, info.classes, unit.width)
 
 
 def count_free_parameters(model) -> int:
@@ -197,7 +235,7 @@ def apply_masks(model, masks):
                 param.mul_(masks[name])
 
 
-def train(model, x, y, exp, epochs=None, masks=None, verbose=False):
+def train(model, x, y, unit, epochs=None, masks=None, verbose=False):
     """Minimize the experiment's loss with Adam.
 
     The weight decay is not cosmetic for OBD: without it hidden units
@@ -205,14 +243,14 @@ def train(model, x, y, exp, epochs=None, masks=None, verbose=False):
     loss, where the quadratic saliency estimate breaks down.
     If masks are given, pruned weights are kept at zero.
     """
-    loss_fn = LOSSES[exp.loss]
-    optimizer = torch.optim.Adam(model.parameters(), lr=exp.lr,
-                                 weight_decay=exp.weight_decay)
+    loss_fn = LOSSES[unit.loss]
+    optimizer = torch.optim.Adam(model.parameters(), lr=unit.lr,
+                                 weight_decay=unit.weight_decay)
     model.train()
-    for epoch in range(epochs if epochs is not None else exp.epochs):
+    for epoch in range(epochs if epochs is not None else unit.epochs):
         perm = torch.randperm(len(x), device=x.device)
-        for i in range(0, len(x), exp.batch_size):
-            idx = perm[i:i + exp.batch_size]
+        for i in range(0, len(x), unit.batch):
+            idx = perm[i:i + unit.batch]
             optimizer.zero_grad()
             loss_fn(model(x[idx]), y[idx]).backward()
             optimizer.step()
@@ -312,15 +350,16 @@ def diagonal_hessian(model, x, loss="mse", batch_size=None, max_samples=None,
         idx = torch.randperm(len(x), device=x.device)[:max_samples]
         x = x[idx]
 
+    was_training = model.training
+    model.eval()  # BatchNorm must use its running statistics for the Jacobians
     try:
         return _hessian_pass(model, x, params, buffers, loss, batch_size, n_outputs)
     except (RuntimeError, NotImplementedError) as err:
-        # torch.func coverage on MPS (and some CUDA builds) is incomplete;
-        # the diagonal is worth an expensive CPU pass rather than a crash.
-        if x.device.type == "cpu":
+        # torch.func coverage on MPS is incomplete; the diagonal is worth an
+        # expensive CPU pass rather than a crash. Other devices fail loudly.
+        if x.device.type != "mps":
             raise
-        print(f"  warning: Hessian pass failed on {x.device.type} ({err}); "
-              f"retrying on cpu")
+        print(f"  warning: Hessian pass failed on mps ({err}); retrying on cpu")
         device = x.device
         cpu_model = model.to("cpu")
         try:
@@ -332,6 +371,8 @@ def diagonal_hessian(model, x, loss="mse", batch_size=None, max_samples=None,
         finally:
             model.to(device)
         return {name: value.to(device) for name, value in h.items()}
+    finally:
+        model.train(was_training)
 
 
 def saliencies(model, x, loss="mse", max_samples=None, names=None):
@@ -380,31 +421,61 @@ def unflatten(vector, like, names):
     return out
 
 
-# Deletion scores, in increasing order of what they assume about the curvature.
-# All three are of the form (something) * w^2, so they differ only in how the
-# curvature factor varies across weights:
+# Deletion scores. The first three are of the form (something) * w^2, so they
+# differ only in how the curvature factor varies across weights:
 #
 #   magnitude           s = w^2               h treated as constant everywhere
 #   saliency_layermean  s = 1/2 h_bar_L w^2   h treated as constant per layer
 #   saliency            s = 1/2 h_kk w^2      the full Gauss-Newton diagonal
 #
 # The middle one is the control for "is OBD's advantage over magnitude just
-# cross-layer budget allocation?" — see experiments.overlap_analysis.
-RANKINGS = ("magnitude", "saliency_layermean", "saliency")
+# cross-layer budget allocation?" (see experiments.overlap_analysis). Two more
+# controls: `random` (the floor any criterion must beat) and `taylor`, the
+# first-order estimate |g * w| of the loss change (a gradient-based criterion
+# that ignores curvature).
+RANKINGS = ("magnitude", "random", "taylor", "saliency_layermean", "saliency")
 
 
-def scores_for(model, x_train, rank_by, exp):
-    """Per-weight deletion scores. Higher score = more worth keeping."""
+def taylor_scores(model, x, y, loss, names, max_samples=None, batch_size=512):
+    """First-order Taylor score |w * dL/dw|, gradients averaged over x."""
+    params = dict(model.named_parameters())
+    loss_fn = LOSSES[loss]
+    if max_samples is not None and max_samples < len(x):
+        idx = torch.randperm(len(x), device=x.device)[:max_samples]
+        x, y = x[idx], y[idx]
+    was_training = model.training
+    model.eval()
+    grads = {n: torch.zeros_like(params[n]) for n in names}
+    for i in range(0, len(x), batch_size):
+        model.zero_grad()
+        loss_fn(model(x[i:i + batch_size]), y[i:i + batch_size],
+                reduction="sum").backward()
+        for n in names:
+            grads[n] += params[n].grad
+    model.zero_grad()
+    model.train(was_training)
+    return {n: (params[n].detach() * grads[n] / len(x)).abs() for n in names}
+
+
+def scores_for(model, data, rank_by, unit):
+    """Per-weight deletion scores. Higher score = more worth keeping.
+    data = (x_train, y_train)."""
+    x_train, y_train = data
     names = prunable_names(model)
     params = dict(model.named_parameters())
     if rank_by == "magnitude":
         return {name: params[name].detach().abs() for name in names}
+    if rank_by == "random":
+        return {name: torch.rand_like(params[name]) for name in names}
+    if rank_by == "taylor":
+        return taylor_scores(model, x_train, y_train, unit.loss, names,
+                             max_samples=unit.hessian_samples)
     if rank_by == "saliency":
-        return saliencies(model, x_train, loss=exp.loss,
-                          max_samples=exp.hessian_samples, names=names)
+        return saliencies(model, x_train, loss=unit.loss,
+                          max_samples=unit.hessian_samples, names=names)
     if rank_by == "saliency_layermean":
-        h = diagonal_hessian(model, x_train, loss=exp.loss,
-                             max_samples=exp.hessian_samples, names=names)
+        h = diagonal_hessian(model, x_train, loss=unit.loss,
+                             max_samples=unit.hessian_samples, names=names)
         return {name: 0.5 * h[name].mean() * params[name].detach() ** 2
                 for name in names}
     raise ValueError(f"unknown ranking {rank_by!r}; choose from {list(RANKINGS)}")

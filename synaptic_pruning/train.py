@@ -1,140 +1,142 @@
-"""One training run: build a model, train it under one of the four
-regularization methods the paper compares, evaluate MAE. This is the unit
-both experiments (replication grid, bitter-lesson grid) sweep over.
+"""One training run (a `Unit`): build a model, train it under one
+regularization method, and record validation and test MAE after every epoch.
 
-Methods, matching the paper's four-way comparison:
+Methods:
 
-    none        no dropout, no pruning — the unregularized baseline
-    dropout     standard dropout (disabled at eval)
-    mc_dropout  same dropout module, kept active at eval, averaged over K
-                stochastic forward passes
-    pruning     no dropout; a SynapticPruner (pruning.py) permanently zeros
-                the globally-smallest-magnitude weights on the paper's
-                cubic schedule
+    none            no regularization: the baseline
+    dropout         dropout on the last hidden state (off at eval)
+    mc_dropout      the same module kept on at eval, averaged over K passes
+    l2              decoupled weight decay (AdamW)
+    pruning         synaptic pruning: the paper's cubic schedule, global magnitude
+    random_pruning  the same schedule and sparsity, but weights chosen at random
+    oneshot         train dense for half the epochs, prune once to smax, fine-tune
+    narrow          a dense net narrowed to the parameter count `pruning` leaves
+
+The headline number is the test MAE at the epoch with the best validation
+MAE (early-stopping model selection; the test set never picks anything).
+The final-epoch test MAE is recorded too.
 """
 
+import math
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 
-from models import build
+from datasets import load
+from models import build, count_prunable_params
 from pruning import PruneConfig, SynapticPruner
 
-METHODS = ("none", "dropout", "mc_dropout", "pruning")
-DROPOUT_RATE = 0.3  # paper doesn't publish its dropout baseline rate; 0.3
-                     # matches smin so the two methods start from a
-                     # comparable sparsity floor
+METHODS = ("none", "dropout", "mc_dropout", "l2", "pruning", "random_pruning",
+           "oneshot", "narrow")
 MC_SAMPLES = 20
 
 
-@dataclass
-class RunConfig:
-    model_type: str = "lstm"       # "rnn" | "lstm"
-    method: str = "none"           # one of METHODS
-    hidden_size: int = 32
-    num_layers: int = 1
-    epochs: int = 20
-    batch_size: int = 64
-    lr: float = 1e-3
-    seed: int = 0
-    device: str = "cpu"
-    prune_smin: float = 0.3
-    prune_smax: float = 0.7
-    prune_warmup_epochs: int = 2
+@dataclass(frozen=True)
+class Unit:
+    """One run. Fields a method does not use are held at their defaults, so a
+    unit's key identifies exactly what was run."""
+    dataset: str
+    arch: str
+    width: int
+    train_frac: float
+    epochs: int
+    seq_len: int
+    method: str
+    seed: int
+    dropout: float = 0.0        # dropout / mc_dropout
+    weight_decay: float = 0.0   # l2
+    smin: float = 0.3           # pruning family and narrow
+    smax: float = 0.7
+    horizon: int = 0            # cubic ramp length in epochs; 0 = the whole run
+    warmup: int = 2
     prune_every: int = 5
-    prune_schedule_epochs: int = 20  # ramp horizon, independent of `epochs`
-                                      # (see pruning.py:PruneConfig)
+    lr: float = 1e-3
+    batch_size: int = 64
+    n_cap: int | None = None    # cap on windows per split (smoke tests)
+
+
+def narrow_width(width, smax):
+    """Width whose weight-matrix parameter count matches a width-`width` net at
+    sparsity smax (weights scale with width squared), in multiples of 4."""
+    return max(4, 4 * round(width * math.sqrt(1.0 - smax) / 4))
 
 
 def _batches(x, y, batch_size, generator):
-    n = x.shape[0]
-    perm = torch.randperm(n, generator=generator)
-    for i in range(0, n, batch_size):
+    perm = torch.randperm(x.shape[0], generator=generator).to(x.device)
+    for i in range(0, x.shape[0], batch_size):
         idx = perm[i:i + batch_size]
         yield x[idx], y[idx]
 
 
 @torch.no_grad()
-def _mae(model, x, y):
-    model.eval()
-    pred = model(x)
+def _mae(model, x, y, mc=False):
+    if mc:  # MC dropout: dropout stays active, average MC_SAMPLES passes
+        model.train()
+        pred = torch.stack([model(x) for _ in range(MC_SAMPLES)]).mean(dim=0)
+    else:
+        model.eval()
+        pred = model(x)
     return (pred - y).abs().mean().item()
 
 
-@torch.no_grad()
-def predict_mc(model, x, k=MC_SAMPLES):
-    """MC Dropout: force dropout active at eval time, average k stochastic
-    forward passes."""
-    model.train()  # keeps nn.Dropout stochastic
-    preds = torch.stack([model(x) for _ in range(k)], dim=0)
-    return preds.mean(dim=0)
+def train_one(unit, device, verbose=False):
+    """Train one model. Returns the record written to the log (minus identity)."""
+    torch.manual_seed(unit.seed)
+    generator = torch.Generator().manual_seed(unit.seed)
+    data = load(unit.dataset, unit.seq_len, unit.train_frac, unit.n_cap)
+    x_tr, y_tr = (torch.from_numpy(a).to(device) for a in data.train)
+    x_va, y_va = (torch.from_numpy(a).to(device) for a in data.val)
+    x_te, y_te = (torch.from_numpy(a).to(device) for a in data.test)
 
-
-@torch.no_grad()
-def _mae_mc(model, x, y, k=MC_SAMPLES):
-    pred = predict_mc(model, x, k=k)
-    return (pred - y).abs().mean().item()
-
-
-def train_one(cfg: RunConfig, x_tr, y_tr, x_te, y_te, verbose=False):
-    """Train one model under one method. Returns a dict with the loss curve,
-    per-epoch test MAE, final test MAE, and (for pruning) the sparsity
-    trajectory and final sparsity stats."""
-    torch.manual_seed(cfg.seed)
-    generator = torch.Generator().manual_seed(cfg.seed)
-
-    dropout = DROPOUT_RATE if cfg.method in ("dropout", "mc_dropout") else 0.0
-    model = build(cfg.model_type, x_tr.shape[-1], hidden_size=cfg.hidden_size,
-                  num_layers=cfg.num_layers, dropout=dropout).to(cfg.device)
-    x_tr, y_tr = x_tr.to(cfg.device), y_tr.to(cfg.device)
-    x_te, y_te = x_te.to(cfg.device), y_te.to(cfg.device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    width = narrow_width(unit.width, unit.smax) if unit.method == "narrow" else unit.width
+    model = build(unit.arch, data.n_features, width, unit.seq_len,
+                  dropout=unit.dropout if unit.method in ("dropout", "mc_dropout") else 0.0).to(device)
+    mc = unit.method == "mc_dropout"
+    optimizer = torch.optim.AdamW(model.parameters(), lr=unit.lr,
+                                  weight_decay=unit.weight_decay if unit.method == "l2" else 0.0)
     loss_fn = nn.L1Loss()
 
     pruner = None
-    if cfg.method == "pruning":
-        pcfg = PruneConfig(smin=cfg.prune_smin, smax=cfg.prune_smax,
-                            warmup_epochs=cfg.prune_warmup_epochs,
-                            schedule_epochs=cfg.prune_schedule_epochs,
-                            prune_every=cfg.prune_every)
-        pruner = SynapticPruner(model, pcfg)
+    if unit.method in ("pruning", "random_pruning", "oneshot"):
+        pruner = SynapticPruner(model, PruneConfig(
+            smin=unit.smin, smax=unit.smax, warmup_epochs=unit.warmup,
+            schedule_epochs=unit.horizon or unit.epochs, prune_every=unit.prune_every,
+            kind="oneshot" if unit.method == "oneshot" else "cubic",
+            select="random" if unit.method == "random_pruning" else "magnitude",
+            oneshot_epoch=unit.epochs // 2 + 1))
 
-    history, sparsity_trace = [], []
-    for epoch in range(cfg.epochs):
+    history = {"train_loss": [], "val_mae": [], "test_mae": [], "sparsity": []}
+    for epoch in range(unit.epochs):
         model.train()
-        epoch_loss = 0.0
-        n_batches = 0
-        for xb, yb in _batches(x_tr, y_tr, cfg.batch_size, generator):
+        total, n_batches = 0.0, 0
+        for xb, yb in _batches(x_tr, y_tr, unit.batch_size, generator):
             optimizer.zero_grad()
-            pred = model(xb)
-            loss = loss_fn(pred, yb)
+            loss = loss_fn(model(xb), yb)
             loss.backward()
             if pruner is not None:
-                pruner.step(epoch + 1)  # paper's schedule is 1-indexed (1..total_epochs)
+                pruner.step(epoch + 1)
             optimizer.step()
             if pruner is not None:
                 pruner.apply_masks()
-            epoch_loss += loss.item()
+            total += loss.item()
             n_batches += 1
-
-        train_loss = epoch_loss / max(1, n_batches)
-        test_mae = (_mae_mc(model, x_te, y_te) if cfg.method == "mc_dropout"
-                    else _mae(model, x_te, y_te))
-        record = {"epoch": epoch, "train_loss": train_loss, "test_mae": test_mae}
+        history["train_loss"].append(total / max(1, n_batches))
+        history["val_mae"].append(_mae(model, x_va, y_va, mc))
+        history["test_mae"].append(_mae(model, x_te, y_te, mc))
         if pruner is not None:
-            sparsity = pruner.sparsity_stats()["_overall"]["sparsity"]
-            record["sparsity"] = sparsity
-            sparsity_trace.append(sparsity)
-        history.append(record)
+            history["sparsity"].append(pruner.sparsity_stats()["_overall"]["sparsity"])
         if verbose:
-            print(f"  epoch {epoch:3d}  train_loss {train_loss:.4f}  "
-                  f"test_mae {test_mae:.4f}"
-                  + (f"  sparsity {record['sparsity']:.2f}" if pruner else ""))
+            print(f"  epoch {epoch:3d}  train {history['train_loss'][-1]:.4f}  "
+                  f"val {history['val_mae'][-1]:.4f}  test {history['test_mae'][-1]:.4f}")
 
-    result = {"history": history, "final_test_mae": history[-1]["test_mae"]}
-    if pruner is not None:
-        result["sparsity_trace"] = sparsity_trace
-        result["sparsity_stats"] = pruner.sparsity_stats()
-    return result
+    best = min(range(unit.epochs), key=history["val_mae"].__getitem__)
+    return {
+        "history": {k: [round(v, 5) for v in vs] for k, vs in history.items() if vs},
+        "test_mae": history["test_mae"][best], "val_mae": history["val_mae"][best],
+        "best_epoch": best + 1,
+        "test_mae_final": history["test_mae"][-1], "val_mae_final": history["val_mae"][-1],
+        "persistence": data.persistence, "n_train": len(y_tr),
+        "n_prunable": count_prunable_params(model),
+        "sparsity": history["sparsity"][-1] if history["sparsity"] else 0.0,
+    }

@@ -1,16 +1,13 @@
-"""The pruning experiments.
+"""The pruning experiments, run on one trained network (a `Unit`).
 
-Three families, all keyed in PRUNE_EXPERIMENTS and written to
-results/<name>.json by main.run_experiments:
+  sweep_no_retrain          delete more and more weights, no retraining
+  iterative_prune_retrain   prune a little, retrain a little, repeat
+  overlap_analysis          how much do the OBD and magnitude rankings agree,
+                            and where does the curvature term carry information?
 
-  sweep_no_retrain      delete more and more weights, no retraining (Figs 2, 3)
-  iterative_prune_retrain   prune a little, retrain a little, repeat (Fig 4)
-  overlap_analysis      how much do the OBD and magnitude rankings agree,
-                        and where does the curvature term carry information?
-                        (Figs 5, 6, 7)
-
-The core math (models, diagonal Hessian, saliencies, mask primitives) lives
-in obd.py; plotting in figures.py.
+All experiments visit the same `FRACTIONS` of the prunable weights, so curves
+from different architectures and datasets share a grid. The core math (models,
+diagonal Hessian, saliencies, mask primitives) lives in obd.py.
 """
 
 import copy
@@ -21,27 +18,31 @@ import torch
 from obd import (apply_masks, diagonal_hessian, evaluate, flatten, initial_masks,
                  keep_mask, prunable_names, prune_to, scores_for, train)
 
+# fractions of the prunable weights kept, in the order they are visited
+FRACTIONS = (0.7, 0.5, 0.35, 0.25, 0.18, 0.12, 0.08, 0.05, 0.03, 0.02, 0.01, 0.005)
 
-# --------------------------------------------------------------------------
-# shared helpers
-# --------------------------------------------------------------------------
-
-def sweep_targets(n_total, exp):
-    """Log-spaced weight counts to prune down to, largest first.
-
-    Log spacing because the interesting behaviour is spread over orders of
-    magnitude: nothing happens between 100% and 80% remaining, and everything
-    happens in the last decade. Excludes n_total itself (that's the baseline
-    point, which callers record separately).
-    """
-    lo = float(min(exp.sweep_min_remaining, n_total))
-    hi = float(n_total)
-    targets = torch.logspace(math.log10(lo), math.log10(hi), exp.sweep_points)
-    descending = targets.long().unique(sorted=True).flip(0).tolist()
-    return [n for n in descending if n < n_total]
+# criteria run in each experiment
+SWEEP_CRITERIA = (("magnitude", False), ("random", False), ("taylor", False),
+                  ("saliency", False), ("saliency", True),
+                  ("saliency_layermean", False))
+RETRAIN_CRITERIA = ("magnitude", "random", "taylor", "saliency_layermean", "saliency")
 
 
-def _setup(model, exp):
+def _r(x):
+    return round(float(x), 6)
+
+
+def sweep_targets(n_total):
+    """Weight counts to prune down to, largest first (all < n_total)."""
+    counts = [max(1, round(f * n_total)) for f in FRACTIONS]
+    out = []
+    for n in counts:
+        if n < n_total and (not out or n < out[-1]):
+            out.append(n)
+    return out
+
+
+def _setup(model):
     """A prunable copy of the model plus its mask bookkeeping."""
     pruned = copy.deepcopy(model)
     names = prunable_names(pruned)
@@ -50,40 +51,43 @@ def _setup(model, exp):
     return pruned, names, masks, n_total
 
 
-def _point(model, splits, exp, n_remaining):
-    """The train/test loss and accuracy record written for one pruning level."""
-    (x_tr, y_tr, l_tr), (x_te, y_te, l_te) = splits
-    loss_tr, acc_tr = evaluate(model, x_tr, y_tr, l_tr, exp.loss)
-    loss_te, acc_te = evaluate(model, x_te, y_te, l_te, exp.loss)
-    return {"remaining": n_remaining, "train_loss": loss_tr, "test_loss": loss_te,
-            "train_acc": acc_tr, "test_acc": acc_te}
+def _point(model, splits, unit, n_remaining, n_total):
+    """Train/val/test loss and accuracy for one pruning level."""
+    point = {"remaining": n_remaining, "keep": _r(n_remaining / n_total)}
+    for split in ("train", "val", "test"):
+        x, y, labels = splits[split]
+        loss, acc = evaluate(model, x, y, labels, unit.loss)
+        point[f"{split}_loss"], point[f"{split}_acc"] = _r(loss), _r(acc)
+    return point
+
+
+def _train_data(splits):
+    return splits["train"][0], splits["train"][1]
 
 
 # --------------------------------------------------------------------------
-# Experiment 1 (Figs 2 & 3): delete weights without retraining
+# Delete weights without retraining
 # --------------------------------------------------------------------------
 
-def sweep_no_retrain(model, splits, rank_by, exp, recompute=False):
-    """Delete increasing numbers of weights without retraining (Figs 2, 3).
+def sweep_no_retrain(model, splits, rank_by, unit, recompute=False):
+    """Delete increasing numbers of weights without retraining.
 
     With recompute=False the ranking is computed once on the trained net.
     With recompute=True the scores are recomputed on the pruned net before
     each further deletion - still no retraining. The distinction matters:
     the saliency is a local second-order estimate, so a ranking computed at
-    the full network goes stale as weights are deleted. (Magnitude ranking is
-    unaffected - deletion doesn't change the surviving |w|.)
+    the full network goes stale as weights are deleted.
     """
-    x_tr = splits[0][0]
-    label = rank_by + ("-recomputed" if recompute else "")
-    pruned, names, masks, n_total = _setup(model, exp)
-    scores = scores_for(pruned, x_tr, rank_by, exp)
+    data = _train_data(splits)
+    pruned, names, masks, n_total = _setup(model)
+    scores = scores_for(pruned, data, rank_by, unit)
 
-    base = _point(model, splits, exp, n_total)
+    base = _point(model, splits, unit, n_total, n_total)
     results = [base]
     predicted = 0.0
-    for n_remaining in sweep_targets(n_total, exp):
+    for n_remaining in sweep_targets(n_total):
         if recompute and len(results) > 1:
-            scores = scores_for(pruned, x_tr, rank_by, exp)
+            scores = scores_for(pruned, data, rank_by, unit)
         before = flatten(masks, names) > 0
         masks = prune_to(masks, scores, n_remaining, names)
         newly_deleted = before & (flatten(masks, names) == 0)
@@ -92,43 +96,40 @@ def sweep_no_retrain(model, splits, rank_by, exp, recompute=False):
             predicted += flatten(scores, names)[newly_deleted].sum().item()
         apply_masks(pruned, masks)
 
-        point = _point(pruned, splits, exp, n_remaining)
+        point = _point(pruned, splits, unit, n_remaining, n_total)
         if rank_by.startswith("saliency"):
             point["predicted_increase"] = predicted
-            point["actual_increase"] = point["train_loss"] - base["train_loss"]
+            point["actual_increase"] = _r(point["train_loss"] - base["train_loss"])
         results.append(point)
-        print(f"  [{label}] {n_remaining:7d} weights left  "
-              f"train loss {point['train_loss']:.4f}")
     return results
 
 
 # --------------------------------------------------------------------------
-# Experiment 2 (Fig 4): the full OBD loop
+# The prune-retrain loop
 # --------------------------------------------------------------------------
 
-def iterative_prune_retrain(model, splits, exp, rank_by="saliency"):
-    """Prune, retrain, repeat (Fig 4).
+def iterative_prune_retrain(model, splits, unit, rank_by="saliency"):
+    """Prune to the next fraction, retrain, repeat.
 
-    rank_by="saliency" is OBD proper; rank_by="magnitude" is the control
-    that isolates how much of Fig 4's result is the saliency ranking and
-    how much is just prune-a-little-retrain-a-little.
+    Each level records the damage right after pruning (`pre_*`) and the state
+    after retraining. rank_by="magnitude" is the control that isolates how
+    much of the result is the ranking and how much is just
+    prune-a-little-retrain-a-little; "random" is the floor.
     """
-    x_tr, y_tr = splits[0][0], splits[0][1]
-    model, names, masks, n_remaining = _setup(model, exp)
+    x_tr, y_tr = _train_data(splits)
+    model, names, masks, n_total = _setup(model)
 
-    results = []
-    while n_remaining >= exp.retrain_min_remaining:
-        point = _point(model, splits, exp, n_remaining)
-        results.append(point)
-        print(f"  [retrain-{rank_by}] {n_remaining:7d} weights left  "
-              f"train loss {point['train_loss']:.4f}  "
-              f"test loss {point['test_loss']:.4f}  test acc {point['test_acc']:.3f}")
-
-        n_remaining = int(n_remaining * exp.shrink)
-        scores = scores_for(model, x_tr, rank_by, exp)
+    results = [_point(model, splits, unit, n_total, n_total)]
+    for n_remaining in sweep_targets(n_total):
+        scores = scores_for(model, (x_tr, y_tr), rank_by, unit)
         masks = prune_to(masks, scores, n_remaining, names)
         apply_masks(model, masks)
-        train(model, x_tr, y_tr, exp, epochs=exp.retrain_epochs, masks=masks)
+        pre = _point(model, splits, unit, n_remaining, n_total)
+        train(model, x_tr, y_tr, unit, epochs=unit.retrain_epochs, masks=masks)
+        point = _point(model, splits, unit, n_remaining, n_total)
+        for k in ("val_loss", "val_acc", "test_loss", "test_acc"):
+            point["pre_" + k] = pre[k]
+        results.append(point)
     return results
 
 
@@ -151,14 +152,13 @@ def iterative_prune_retrain(model, splits, exp, rank_by="saliency"):
 #                           / (sigma_w sqrt(4 sigma_w^2 + sigma_h^2 + 4 sigma_hw))
 #
 # The two rankings agree closely when sigma_h << 2 sigma_w, and positive
-# covariance (which weight decay induces - see obd.ipynb §6) pushes agreement higher
+# covariance (which weight decay induces) pushes agreement higher
 # still. `between_layer_frac` then asks where sigma_h^2 comes from: if most of
 # it is differences between layer means rather than spread within a layer,
 # the curvature term acts as a per-layer offset, and OBD's only real advantage
 # over magnitude is how it splits the pruning budget across layers.
 # --------------------------------------------------------------------------
 
-SCATTER_POINTS = 4000   # subsampled for fig6; the full vectors are far too many
 KENDALL_POINTS = 2048   # tau is O(n^2), so it gets a subsample; Spearman is exact
 
 
@@ -217,20 +217,19 @@ def _layer_index(masks, names):
                       for i, name in enumerate(names)])
 
 
-def overlap_analysis(model, splits, exp):
+def overlap_analysis(model, splits, unit):
     """Compare the OBD and magnitude rankings of the trained network.
 
     Everything is computed once, at the trained weights, over the live
     prunable entries (structurally absent connection-table entries excluded).
     """
-    x_tr = splits[0][0]
+    x_tr = splits["train"][0]
     names = prunable_names(model)
     params = dict(model.named_parameters())
     masks = initial_masks(model)
 
-    print("  [overlap] computing the diagonal Hessian...")
-    h_by_name = diagonal_hessian(model, x_tr, loss=exp.loss,
-                                 max_samples=exp.hessian_samples, names=names)
+    h_by_name = diagonal_hessian(model, x_tr, loss=unit.loss,
+                                 max_samples=unit.hessian_samples, names=names)
 
     live = (flatten(masks, names) > 0).cpu()
     layer = _layer_index(masks, names)[live]
@@ -288,7 +287,7 @@ def overlap_analysis(model, splits, exp):
 
     # how much of each ranking's kept set is shared, at every pruning level
     overlap_curve, allocation = [], []
-    for n_remaining in [n_total] + sweep_targets(n_total, exp):
+    for n_remaining in [n_total] + sweep_targets(n_total):
         keep_obd = keep_mask(s, n_remaining)
         keep_mag = keep_mask(w, n_remaining)
         shared = int((keep_obd & keep_mag).sum().item())
@@ -311,13 +310,9 @@ def overlap_analysis(model, splits, exp):
             "layer_size": {names[i]: int((layer == i).sum().item())
                            for i in range(len(names))},
         })
-        print(f"  [overlap] {n_remaining:7d} weights left  "
-              f"shared {shared / n_remaining:.3f}  (chance {n_remaining / n_total:.3f})")
 
     generator = torch.Generator().manual_seed(0)
     kendall = _kendall_subsample(s, w, generator)
-    pick = torch.randperm(int(ok.sum().item()), generator=generator)[:SCATTER_POINTS]
-
     return _json_safe({
         "n_prunable": n_total,
         "n_dropped_zero": n_dropped,
@@ -332,38 +327,9 @@ def overlap_analysis(model, splits, exp):
             "var_log_w": var_w,
             "cov_log_h_log_w": cov,
             "between_layer_frac": between / var_h if var_h > 0 else float("nan"),
-            "weight_decay": exp.weight_decay,
+            "weight_decay": unit.weight_decay,
         },
         "per_layer": per_layer,
         "overlap_curve": overlap_curve,
         "layer_allocation": allocation,
-        "scatter": {
-            "layer": layer_ok[pick].tolist(),
-            "log_w": log_w[pick].tolist(),
-            "log_s": log_s[pick].tolist(),
-        },
     })
-
-
-# --------------------------------------------------------------------------
-# The experiments run_experiments() can run, keyed as in results/<name>.json.
-# --------------------------------------------------------------------------
-
-PRUNE_EXPERIMENTS = {
-    "magnitude":
-        lambda m, s, e: sweep_no_retrain(m, s, "magnitude", e),
-    "saliency":
-        lambda m, s, e: sweep_no_retrain(m, s, "saliency", e),
-    "saliency_recomputed":
-        lambda m, s, e: sweep_no_retrain(m, s, "saliency", e, recompute=True),
-    "saliency_layermean":
-        lambda m, s, e: sweep_no_retrain(m, s, "saliency_layermean", e),
-    "saliency_layermean_recomputed":
-        lambda m, s, e: sweep_no_retrain(m, s, "saliency_layermean", e, recompute=True),
-    "retrain":
-        lambda m, s, e: iterative_prune_retrain(m, s, e, "saliency"),
-    "retrain_magnitude":
-        lambda m, s, e: iterative_prune_retrain(m, s, e, "magnitude"),
-    "overlap":
-        lambda m, s, e: overlap_analysis(m, s, e),
-}

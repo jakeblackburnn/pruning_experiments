@@ -2,5 +2,6 @@
 __pycache__/
 data/
 checkpoints/
-.ipynb_checkpoints/
 .DS_Store
+results/smoke*.jsonl
+results/tables/

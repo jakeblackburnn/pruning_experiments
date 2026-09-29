@@ -27,17 +27,27 @@ class PruneConfig:
     smax: float = 0.7
     warmup_epochs: int = 2
     schedule_epochs: int = 20  # ramp horizon; independent of a run's actual
-                                # total epoch count (see train.py:RunConfig.epochs)
+                                # total epoch count (see train.py:Unit.horizon)
     prune_every: int = 5  # batches
+    kind: str = "cubic"  # "cubic": the paper's ramp; "oneshot": dense until
+                          # `oneshot_epoch`, then straight to smax
+    select: str = "magnitude"  # "magnitude": the paper; "random": the control
+    oneshot_epoch: int = 11
 
 
 def cubic_schedule(epoch, cfg: PruneConfig):
-    """Target sparsity s(t) — Algorithm 2. `epoch` is 1-indexed (1..schedule_epochs),
-    matching the paper's pseudocode, so that s(schedule_epochs) == smax exactly,
-    regardless of how many epochs the run actually trains for. If the run trains
-    longer than schedule_epochs, sparsity holds at smax for the remaining epochs
-    (progress is clamped to 1.0) so the extra epochs are genuine fine-tuning at
-    fixed sparsity, not more ramping."""
+    """Target sparsity s(t). `epoch` is 1-indexed.
+
+    cubic (Algorithm 2): 0 during warmup, then a cubic ramp from smin to smax
+    over `schedule_epochs`, so that s(schedule_epochs) == smax exactly. If the
+    run trains longer, sparsity holds at smax for the remaining epochs
+    (progress is clamped to 1.0): fine-tuning at fixed sparsity, not more ramping.
+
+    oneshot: 0 before `oneshot_epoch`, smax from then on (a dense run followed
+    by a single magnitude prune and fine-tuning).
+    """
+    if cfg.kind == "oneshot":
+        return cfg.smax if epoch >= cfg.oneshot_epoch else 0.0
     if epoch < cfg.warmup_epochs:
         return 0.0
     span = max(1, cfg.schedule_epochs - cfg.warmup_epochs)
@@ -71,12 +81,17 @@ class SynapticPruner:
         for name, p in self.params.items():
             p.mul_(self.masks[name])
 
+    def _scores(self, p):
+        """What the pool is ranked by: |w| (the paper), or noise (the control)."""
+        return p.abs() if self.cfg.select == "magnitude" else torch.rand_like(p)
+
     @torch.no_grad()
-    def _global_magnitude_prune(self, target_sparsity):
-        """Algorithm 3."""
-        active_chunks = [p[self.masks[name]].abs()
-                          for name, p in self.params.items()
-                          if self.masks[name].any()]
+    def _global_prune(self, target_sparsity):
+        """Algorithm 3: pool every unpruned weight, prune the lowest-scored
+        until the network reaches the target sparsity."""
+        scores = {name: self._scores(p) for name, p in self.params.items()}
+        active_chunks = [scores[name][self.masks[name]] for name in self.params
+                         if self.masks[name].any()]
         if not active_chunks:
             return
         all_active = torch.cat(active_chunks)
@@ -88,9 +103,9 @@ class SynapticPruner:
         if n_additional == 0 or n_additional >= n_active:
             return
         threshold = torch.kthvalue(all_active, n_additional).values
-        for name, p in self.params.items():
+        for name in self.params:
             mask = self.masks[name]
-            self.masks[name] = mask & ~((p.abs() < threshold) & mask)
+            self.masks[name] = mask & ~((scores[name] <= threshold) & mask)
         self.apply_masks()
 
     def step(self, epoch):
@@ -102,7 +117,7 @@ class SynapticPruner:
         if epoch < self.cfg.warmup_epochs or self.batch_count % self.cfg.prune_every != 0:
             return None
         target = cubic_schedule(epoch, self.cfg)
-        self._global_magnitude_prune(target)
+        self._global_prune(target)
         self.last_target_sparsity = target
         return target
 

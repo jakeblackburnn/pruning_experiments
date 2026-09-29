@@ -1,219 +1,238 @@
-"""Synaptic Pruning — Vos et al. 2025, reproduced, plus a bitter-lesson
-scaling test. Results: RESULTS.md; walkthrough: synaptic_pruning.ipynb.
+"""Synaptic pruning (Vos et al. 2025) against other regularizers: a budgetable,
+resumable factorial run.
 
-    python3 main.py                  the whole suite in one go (~2 h on an M4):
-                                     replicate -> bitter-lesson -> plot ->
-                                     report -> notebook
+    python3 main.py --budget 60      run for about an hour, then stop
+    python3 main.py --budget 600     ...run again to continue: finished runs are skipped
+    python3 main.py                  run everything that is left
+    python3 main.py --status         progress per block and seed, time left
+    python3 main.py --tables         summary CSVs  -> results/tables/
+    python3 main.py --plot           figures       -> figures/
 
-Stages (each caches its output, so any one can be rerun alone):
+The design (design.py) is a list of runs, each one model trained under one
+method (train.py). Each finished run is appended as one JSON line to
+results/runs.jsonl (the resume state: a run is done once its line exists).
+Runs go seed-major, so any stop leaves complete seeds and a balanced design;
+a run expected to overrun the remaining budget is not started. Ctrl-C loses
+at most the run in flight.
 
-    --replicate      method comparison, RNN/LSTM x seq_len  -> results/replication.json   (~25-30 min)
-    --bitter-lesson  the 6-tier compute-scaling ladder      -> results/bitter_lesson.json (~90 min)
-    --plot           draw the figures                       -> figures/*.png
-    --report         rewrite the generated blocks in RESULTS.md and ../README.md
-    --notebook       execute synaptic_pruning.ipynb in place
+Design selection:
 
-Override config fields (experiments.py: ReplicationConfig, BitterLessonConfig)
-with --set. Each override goes to every selected stage whose config has that
-field, and a field no selected stage has is rejected before anything runs:
+    --design core scale sweep     blocks to run (default: all; see design.py)
+    --seeds N                     seeds per configuration (default 5)
+    --dataset air_quality ...     restrict the design
+    --arch lstm cnn ...           restrict the design
+    --method none pruning ...     restrict the design
+    --set FIELD=VALUE ...         override Unit fields (lr, batch_size, epochs, ...)
+    --smoke                       tiny fast version -> results/smoke.jsonl
 
-    python3 main.py --replicate --set trials=3 epochs=10     faster, noisier
-    python3 main.py --set trials=3                           both stages
-    python3 main.py --replicate --set seq_lens=1,14 model_types=lstm
-
-`tiers` (a tuple of tuples) can't be set this way; edit
-BitterLessonConfig.tiers or build a config in a script.
-
-The device is chosen automatically (Metal, else CUDA, else CPU) and can be
-pinned with --set device=cpu. Each results file's _meta records the config,
-git commit and wall-clock duration. A crashed run is resumed by rerunning the
-stage that failed; nothing is skipped automatically.
-
-Orchestration only: disk I/O, config parsing, the CLI. The pruning algorithm
-lives in pruning.py, models in models.py, one training run in train.py, the
-two experiments in experiments.py, plotting in figures.py, the result briefs
-in report.py, data in datasets.py.
+Runs on CUDA if available, else Metal, else CPU (`--device` pins it).
 """
 
 import argparse
 import dataclasses
 import datetime
 import json
+import subprocess
 import time
 from pathlib import Path
 
 import torch
 
-from experiments import (BitterLessonConfig, ReplicationConfig,
-                         run_bitter_lesson, run_replication)
-import report
-from figures import FIGURES
+import design
+from datasets import DATASETS
+from models import ARCHS, resolve_device
+from train import METHODS, Unit, train_one
 
 ROOT = Path(__file__).parent
 RESULTS_DIR = ROOT / "results"
 FIGURES_DIR = ROOT / "figures"
-NOTEBOOK = ROOT / "synaptic_pruning.ipynb"
-BRIEFS = (ROOT / "RESULTS.md", ROOT.parent / "README.md")
-
-STAGES = {
-    "replication": (ReplicationConfig, run_replication),
-    "bitter_lesson": (BitterLessonConfig, run_bitter_lesson),
-}
+OVERRIDABLE = ("lr", "batch_size", "epochs", "warmup", "prune_every", "n_cap")
+SMOKE = {"epochs": 2, "n_cap": 200}
 
 
-def results_path(stage):
-    return RESULTS_DIR / f"{stage}.json"
+# --------------------------------------------------------------------------
+# One run
+# --------------------------------------------------------------------------
 
-
-def _meta(cfg, duration_s):
-    return {"config": dataclasses.asdict(cfg), "git_commit": report.git_commit(ROOT),
-            "duration_s": round(duration_s, 1), "torch": torch.__version__,
-            "written": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
-
-
-def _coerce(value: str, current):
-    if value.lower() == "none":
+def git_commit(root=ROOT):
+    """Short commit hash, with a -dirty suffix if tracked files are modified."""
+    try:
+        run = lambda *a: subprocess.run(["git", "-C", str(root), *a], capture_output=True,
+                                        text=True, check=True).stdout.strip()
+        dirty = run("status", "--porcelain", "--untracked-files=no")
+        return run("rev-parse", "--short", "HEAD") + ("-dirty" if dirty else "")
+    except (OSError, subprocess.CalledProcessError):
         return None
-    if isinstance(current, bool):
-        return value.lower() in ("1", "true", "yes")
-    if isinstance(current, tuple):
-        return tuple(_coerce(v, current[0]) for v in value.split(","))
-    if isinstance(current, int):
-        return int(value)
-    if isinstance(current, float):
-        return float(value)
-    return value
 
 
-def split_overrides(stages, overrides=()):
-    """{stage: [FIELD=VALUE, ...]}: each override goes to every stage whose
-    config has that field. Raises if a field belongs to none of `stages`,
-    so a typo fails before a long run starts rather than an hour into it."""
-    per_stage = {stage: [] for stage in stages}
-    for item in overrides:
-        field = item.partition("=")[0]
-        owners = [stage for stage in stages
-                  if field in {f.name for f in dataclasses.fields(STAGES[stage][0])}]
-        if not owners:
-            known = sorted({f.name for stage in stages
-                            for f in dataclasses.fields(STAGES[stage][0])})
-            raise ValueError(f"unknown field {field!r} for {stages}; choose from {known}")
-        for stage in owners:
-            per_stage[stage].append(item)
-    return per_stage
-
-
-def configure(stage, overrides=()):
-    config_cls, _ = STAGES[stage]
-    cfg = config_cls()
-    fields = {}
-    for item in overrides:
-        field, _, value = item.partition("=")
-        if not hasattr(cfg, field):
-            raise ValueError(f"unknown field {field!r}; choose from "
-                             f"{[f.name for f in dataclasses.fields(cfg)]}")
-        fields[field] = _coerce(value, getattr(cfg, field))
-    return dataclasses.replace(cfg, **fields)
-
-
-def run_stage(stage, cfg):
-    _, run_fn = STAGES[stage]
-    print(f"[{stage}] config: {cfg}")
+def run_unit(unit, device):
+    """Train one model; returns the record appended to the log."""
     start = time.perf_counter()
-    out = run_fn(cfg)
-    out["_meta"] = _meta(cfg, time.perf_counter() - start)
+    result = train_one(unit, device)
+    return {"key": design.key(unit), "unit": dataclasses.asdict(unit), **result,
+            "_meta": {"git_commit": git_commit(), "device": device,
+                      "gpu": torch.cuda.get_device_name() if device == "cuda" else None,
+                      "torch": torch.__version__,
+                      "duration_s": round(time.perf_counter() - start, 2),
+                      "written": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}}
+
+
+# --------------------------------------------------------------------------
+# The log: results/*.jsonl, one finished run per line
+# --------------------------------------------------------------------------
+
+def load_log(path):
+    """Finished runs, in file order. A truncated last line (a run killed
+    mid-write) is ignored."""
+    records = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return records
+
+
+def append_record(path, record):
     RESULTS_DIR.mkdir(exist_ok=True)
-    path = results_path(stage)
-    path.write_text(json.dumps(out, indent=2))
-    print(f"saved {path}")
+    text = path.read_text() if path.exists() else ""
+    prefix = "\n" if text and not text.endswith("\n") else ""
+    with open(path, "a") as f:
+        f.write(prefix + json.dumps(record, allow_nan=False) + "\n")
+        f.flush()
+
+
+def fmt_duration(seconds):
+    hours = seconds / 3600
+    return f"{hours:.1f} h" if hours >= 1 else f"{seconds / 60:.0f} min"
+
+
+# --------------------------------------------------------------------------
+# Running with a budget
+# --------------------------------------------------------------------------
+
+def run(units, path, device, budget_min=None):
+    records = load_log(path)
+    done_keys = {r["key"] for r in records}
+    pending = [u for u in design.ordered(units) if design.key(u) not in done_keys]
+    cost = design.CostModel(records)
+    deadline = time.monotonic() + budget_min * 60 if budget_min else None
+    print(f"{len(units) - len(pending)}/{len(units)} runs done; {len(pending)} to go"
+          + (f"; budget {budget_min:g} min" if budget_min else "") + f"; device {device}")
+
+    ran = 0
+    try:
+        while pending:
+            left = deadline - time.monotonic() if deadline else float("inf")
+            pick = next((u for u in pending
+                         if (est := cost.estimate(u)) is None or est <= left), None)
+            if left <= 0 or pick is None:
+                print("budget used up; run again to continue")
+                break
+            pending.remove(pick)
+            est = cost.estimate(pick)
+            print(f"[{ran + 1}] {pick.dataset}/{pick.arch} w{pick.width} data{pick.train_frac:g} "
+                  f"ep{pick.epochs} seq{pick.seq_len} {pick.method} "
+                  f"seed{pick.seed}" + (f"  (~{est:.0f}s)" if est else ""), flush=True)
+            record = run_unit(pick, device)
+            append_record(path, record)
+            cost.add(record)
+            ran += 1
+            print(f"    test MAE {record['test_mae']:.4f}  ({record['_meta']['duration_s']:.0f}s)",
+                  flush=True)
+        else:
+            print("all runs done")
+    except KeyboardInterrupt:
+        print("\ninterrupted; the run in flight is lost, everything else is saved")
+    print(f"ran {ran} run(s) this session")
+
+
+def status(units, block_keys, path):
+    records = load_log(path)
+    done = {r["key"] for r in records}
+    cost = design.CostModel(records)
+    print(f"{path.name}: {sum(design.key(u) in done for u in units)}/{len(units)} runs done")
+    print("\nblock      done / total  (blocks overlap where configurations coincide)")
+    for block, keys in block_keys.items():
+        print(f"  {block:<9}{len(keys & done):>6} / {len(keys)}")
+    print("\nseed       done / total")
+    for seed in sorted({u.seed for u in units}):
+        keys = {design.key(u) for u in units if u.seed == seed}
+        print(f"  {seed:<9}{len(keys & done):>6} / {len(keys)}")
+    remaining = [u for u in units if design.key(u) not in done]
+    ests = [cost.estimate(u) for u in remaining]
+    known = [e for e in ests if e is not None]
+    if remaining:
+        print(f"\nremaining: {len(remaining)} runs, est. {fmt_duration(sum(known))}"
+              + (f" (+ {len(ests) - len(known)} with no estimate yet)"
+                 if len(known) < len(ests) else ""))
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+def parse_overrides(items):
+    template = Unit("air_quality", "lstm", 64, 1.0, 20, 14, "none", 0)
+    out = {}
+    for item in items:
+        field, _, value = item.partition("=")
+        if field not in OVERRIDABLE:
+            raise ValueError(f"cannot override {field!r}; choose from {list(OVERRIDABLE)}")
+        current = getattr(template, field)
+        if value.lower() == "none":
+            out[field] = None
+        elif isinstance(current, float):
+            out[field] = float(value)
+        else:
+            out[field] = int(float(value))
     return out
 
 
-def load_results(stage):
-    path = results_path(stage)
-    if not path.exists():
-        raise FileNotFoundError(f"{path} not found — run `python3 main.py --{stage.replace('_', '-')}`")
-    return json.loads(path.read_text())
-
-
-def load_all_results():
-    """Every stage's cached results that exist, noting the ones that don't."""
-    results = {}
-    for stage in STAGES:
-        try:
-            results[stage] = load_results(stage)
-        except FileNotFoundError as e:
-            print(f"  note: {e}")
-    return results
-
-
-def make_all_figures(save=True):
-    results = load_all_results()
-    FIGURES_DIR.mkdir(exist_ok=True)
-    drawn = {}
-    for name, fn in FIGURES.items():
-        fig = fn(results)
-        if fig is None:
-            continue
-        drawn[name] = fig
-        if save:
-            path = FIGURES_DIR / f"{name}.png"
-            fig.savefig(path, bbox_inches="tight")
-            print(f"saved {path}")
-    return drawn
-
-
-def make_report():
-    """Rewrite the generated blocks of every brief from the cached results."""
-    report.write_all(BRIEFS, report.render(load_all_results()))
-
-
 def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--replicate", action="store_true", help="run the replication grid")
-    parser.add_argument("--bitter-lesson", action="store_true", help="run the compute-scaling ladder")
-    parser.add_argument("--plot", action="store_true", help="generate the figures")
-    parser.add_argument("--report", action="store_true",
-                        help="rewrite the generated blocks in RESULTS.md and ../README.md")
-    parser.add_argument("--notebook", action="store_true",
-                        help="execute synaptic_pruning.ipynb in place")
-    parser.add_argument("--set", nargs="*", default=[], metavar="FIELD=VALUE",
-                        help="override config fields, e.g. --set trials=3 epochs=10")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--budget", type=float, metavar="MIN", help="stop starting runs after MIN minutes")
+    p.add_argument("--design", nargs="+", choices=design.BLOCKS, default=list(design.BLOCKS))
+    p.add_argument("--seeds", type=int, help="seeds per configuration (default 5; 2 with --smoke)")
+    p.add_argument("--dataset", nargs="+", choices=DATASETS)
+    p.add_argument("--arch", nargs="+", choices=list(ARCHS))
+    p.add_argument("--method", nargs="+", choices=METHODS)
+    p.add_argument("--set", nargs="*", default=[], metavar="FIELD=VALUE")
+    p.add_argument("--device", default="auto")
+    p.add_argument("--smoke", action="store_true", help="tiny fast run into results/smoke.jsonl")
+    p.add_argument("--run", action="store_true", help="run (the default unless a report flag is given)")
+    p.add_argument("--status", action="store_true", help="show progress and estimated time left")
+    p.add_argument("--tables", action="store_true", help="write summary CSVs to results/tables/")
+    p.add_argument("--plot", action="store_true", help="draw the figures")
+    args = p.parse_args()
 
-    run_all = not (args.replicate or args.bitter_lesson or args.plot
-                   or args.report or args.notebook)
-    stages = [stage for stage, flag in (("replication", args.replicate),
-                                        ("bitter_lesson", args.bitter_lesson))
-              if flag or run_all]
-    if args.set and not stages:
-        parser.error("--set only applies to --replicate / --bitter-lesson")
-    # every override is parsed and type-checked before the first stage starts
     try:
-        configs = {stage: configure(stage, items)
-                   for stage, items in split_overrides(stages, args.set).items()}
+        overrides = {**(SMOKE if args.smoke else {}), **parse_overrides(args.set)}
     except ValueError as err:
-        parser.error(str(err))
-    timings = []
+        p.error(str(err))
+    seeds = args.seeds or (2 if args.smoke else 5)
+    only = {"dataset": args.dataset, "arch": args.arch, "method": args.method}
+    units = design.all_units(args.design, seeds, overrides, only)
+    path = RESULTS_DIR / ("smoke.jsonl" if args.smoke else "runs.jsonl")
 
-    def timed(label, fn, *fn_args):
-        start = time.perf_counter()
-        fn(*fn_args)
-        timings.append((label, time.perf_counter() - start))
-
-    for stage, cfg in configs.items():
-        timed(stage, run_stage, stage, cfg)
-    if args.plot or run_all:
-        timed("plot", make_all_figures)
-    if args.report or run_all:
-        timed("report", make_report)
-    if args.notebook or run_all:
-        timed("notebook", report.execute_notebook, NOTEBOOK)
-
-    print("\ntimings:")
-    for label, seconds in timings:
-        print(f"  {label:<16} {report.minutes(seconds)}")
+    reports = args.status or args.tables or args.plot
+    if args.run or not reports:
+        run(units, path, resolve_device(args.device), args.budget)
+    if args.status:
+        block_keys = {b: {design.key(u) for u in design.all_units([b], seeds, overrides, only)}
+                      for b in args.design}
+        status(units, block_keys, path)
+    if args.tables or args.plot:
+        import aggregate
+        data = aggregate.load(path)
+        if args.tables:
+            aggregate.write_tables(data, RESULTS_DIR / "tables")
+        if args.plot:
+            import figures
+            FIGURES_DIR.mkdir(exist_ok=True)
+            figures.make_all(data, FIGURES_DIR)
 
 
 if __name__ == "__main__":

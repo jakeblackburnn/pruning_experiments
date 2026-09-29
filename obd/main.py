@@ -1,235 +1,224 @@
-"""Optimal Brain Damage — LeCun, Denker & Solla (NIPS 1989), reproduced,
-plus a modern CIFAR-10 counterpart. Results: RESULTS.md; walkthrough: obd.ipynb.
+"""Optimal Brain Damage at modern scales: a budgetable, resumable factorial run.
 
-    python3 main.py                  the whole suite, both datasets, in one go:
-                                     train -> prune -> plot (per dataset), then
-                                     report -> notebook
+    python3 main.py --budget 60      run for about an hour, then stop
+    python3 main.py --budget 600     ...run again to continue: finished units are skipped
+    python3 main.py                  run everything that is left
+    python3 main.py --status         progress per block and seed, time left
+    python3 main.py --tables         summary CSVs  -> results/tables/
+    python3 main.py --plot           figures       -> figures/
 
-Stages (each caches its output, so any one can be rerun alone):
+The design (design.py) is a list of units: one trained network plus every
+pruning experiment on it. Each finished unit is appended as one JSON line to
+results/units.jsonl (the resume state: a unit is done once its line exists).
+Units run seed-major, so any stop leaves complete seeds and a balanced design;
+a unit expected to overrun the remaining budget is not started. Ctrl-C loses
+at most the unit in flight.
 
-    --train      train the base network   -> checkpoints/<name>.pt
-    --prune      run pruning experiments  -> results/<name>.json
-    --plot       draw the figures         -> figures/*_<name>.png
-    --report     rewrite the generated blocks in RESULTS.md and ../README.md
-    --notebook   execute obd.ipynb in place
+Design selection:
 
-Datasets (default: both):
+    --design core scale retrain   blocks to run (default: all; see design.py)
+    --seeds N                     seeds per unit (default 5)
+    --dataset mnist cifar10 ...   restrict the design
+    --arch paper mlp vgg resnet   restrict the design
+    --set FIELD=VALUE ...         override Unit fields (hessian_samples, epochs, ...)
+    --smoke                       tiny fast version -> results/smoke.jsonl
 
-    --dataset digits    the paper: 1989 zip-code net, 16x16 digits, MSE
-    --dataset cifar     VGG-style ReLU net (~590k params), CIFAR-10, cross-entropy
-
-The prune stage's experiments can be rerun individually with --only (implies
---prune); they merge into the cached results file:
-
-    magnitude                       delete smallest-|w| first, no retraining
-    saliency, saliency_recomputed   same, ranked by OBD saliency, once / re-ranked each step
-    saliency_layermean[_recomputed] ranked by 1/2 * mean_layer(h) * w^2, the control between the two
-    retrain, retrain_magnitude      the prune-retrain loop, and its magnitude-ranked control
-    overlap                         the ranking-agreement analysis behind Figs 5-7
-
-Any Experiment field (obd.py) can be overridden, typed against its default:
-
-    python3 main.py --dataset cifar --set epochs=5 lr=3e-4 hessian_samples=1024
-    python3 main.py --dataset digits --only retrain_magnitude
-
-The device is chosen automatically (Metal, else CUDA, else CPU). Pin it with
---set device=cpu, which is often *faster* for digits: at 8.8k parameters and
-batch 32, kernel-launch overhead dominates. Each results file's _meta records
-the config, checkpoint hash, git commit and per-experiment durations, and a
-stale merge gets a warning rather than silence. A crashed run is resumed by
-rerunning the stage that failed; nothing is skipped automatically.
-
-Orchestration only: disk I/O, the experiment runner, and the CLI. The OBD math
-lives in obd.py, the experiments in experiments.py, plotting in figures.py,
-the result briefs in report.py.
+Runs on CUDA if available, else Metal, else CPU (`--device` pins it).
 """
 
 import argparse
 import dataclasses
 import datetime
-import hashlib
 import json
+import subprocess
 import time
 from pathlib import Path
 
 import torch
 
-import report
-from datasets import load
-from experiments import PRUNE_EXPERIMENTS
-from figures import FIGURES
-from obd import EXPERIMENTS, SEED, build, evaluate, resolve_device, train
+import design
+from datasets import DATASETS, load_splits
+from experiments import (RETRAIN_CRITERIA, SWEEP_CRITERIA, _json_safe, _point,
+                         iterative_prune_retrain, overlap_analysis, sweep_no_retrain)
+from obd import ARCHS, Unit, build, count_free_parameters, initial_masks, resolve_device, train
 
 ROOT = Path(__file__).parent
-CHECKPOINT_DIR = ROOT / "checkpoints"
 RESULTS_DIR = ROOT / "results"
 FIGURES_DIR = ROOT / "figures"
-NOTEBOOK = ROOT / "obd.ipynb"
-BRIEFS = (ROOT / "RESULTS.md", ROOT.parent / "README.md")
+OVERRIDABLE = ("hessian_samples", "n_cap", "lr", "batch_size", "epochs",
+               "retrain_epochs", "weight_decay")
+SMOKE = {"hessian_samples": 64, "n_cap": 256, "epochs": 1, "retrain_epochs": 1}
 
 
-def checkpoint_path(exp):
-    return CHECKPOINT_DIR / f"{exp.name}.pt"
+# --------------------------------------------------------------------------
+# One unit
+# --------------------------------------------------------------------------
+
+def git_commit(root=ROOT):
+    """Short commit hash, with a -dirty suffix if tracked files are modified."""
+    try:
+        run = lambda *a: subprocess.run(["git", "-C", str(root), *a], capture_output=True,
+                                        text=True, check=True).stdout.strip()
+        dirty = run("status", "--porcelain", "--untracked-files=no")
+        return run("rev-parse", "--short", "HEAD") + ("-dirty" if dirty else "")
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
-def results_path(exp):
-    return RESULTS_DIR / f"{exp.name}.json"
+def _columns(points):
+    """A curve as {field: [values by level]}: the field names are stored once."""
+    keys = list(dict.fromkeys(k for p in points for k in p))
+    return {k: [p.get(k) for p in points] for k in keys}
 
 
-def load_splits(exp):
-    """Both splits, as tensors already moved onto the experiment's device."""
-    return [tuple(t.to(exp.device) for t in split) for split in load(exp)]
+def run_unit(unit, device):
+    """Train the unit's base network and run every pruning experiment on it.
+    Returns the record that is appended to the log."""
+    info = DATASETS[unit.dataset]
+    times = {}
+    t0 = time.perf_counter()
+    torch.manual_seed(unit.seed)
+    splits = load_splits(unit, device)
+    model = build(unit, info).to(device)
+    x_tr, y_tr = splits["train"][0], splits["train"][1]
+    train(model, x_tr, y_tr, unit)
+    n_total = int(sum(m.sum() for m in initial_masks(model).values()).item())
+    base = _point(model, splits, unit, n_total, n_total)
+    times["train"] = time.perf_counter() - t0
 
-
-def train_base_model(exp):
-    """Train the unpruned network and save it to checkpoints/<name>.pt."""
-    torch.manual_seed(SEED)
-    (x_tr, y_tr, l_tr), (x_te, y_te, l_te) = load_splits(exp)
-
-    model = build(exp).to(exp.device)
-    print(f"training base {exp.name} model on {exp.device}...")
-    train(model, x_tr, y_tr, exp, verbose=True)
-
-    loss_tr, acc_tr = evaluate(model, x_tr, y_tr, l_tr, exp.loss)
-    loss_te, acc_te = evaluate(model, x_te, y_te, l_te, exp.loss)
-    print(f"train: loss {loss_tr:.4f}, accuracy {acc_tr:.3f}")
-    print(f"test:  loss {loss_te:.4f}, accuracy {acc_te:.3f}")
-
-    CHECKPOINT_DIR.mkdir(exist_ok=True)
-    torch.save(model.state_dict(), checkpoint_path(exp))
-    print(f"saved {checkpoint_path(exp)}")
-    return model
-
-
-def load_base_model(exp):
-    model = build(exp)
-    model.load_state_dict(torch.load(checkpoint_path(exp), map_location=exp.device))
-    return model.to(exp.device)
-
-
-def _meta(exp, durations):
-    """Provenance for a results file: which config, checkpoint and commit,
-    and how long each experiment took.
-
-    Without this a partial rerun silently merges results from two different
-    base models into one file, and nothing downstream can tell.
-    """
-    path = checkpoint_path(exp)
-    digest = (hashlib.sha1(path.read_bytes()).hexdigest()[:12] if path.exists()
-              else None)
-    return {"config": dataclasses.asdict(exp), "checkpoint_sha1": digest,
-            "git_commit": report.git_commit(ROOT), "durations_s": durations,
-            "torch": torch.__version__,
-            "written": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
-
-
-def check_meta(exp, results):
-    """Warn when cached results were produced by a different configuration."""
-    meta = results.get("_meta")
-    if meta is None:
-        print(f"  note: results/{exp.name}.json predates provenance tracking — "
-              f"rerun the prune stage if in doubt")
-        return
-    current, cached = dataclasses.asdict(exp), meta["config"]
-    changed = {k: (cached.get(k), v) for k, v in current.items()
-               if k != "device" and cached.get(k) != v}
-    if changed:
-        print(f"  warning: results/{exp.name}.json was produced with a different "
-              f"config: {changed}")
-    if meta.get("checkpoint_sha1") and checkpoint_path(exp).exists():
-        digest = hashlib.sha1(checkpoint_path(exp).read_bytes()).hexdigest()[:12]
-        if digest != meta["checkpoint_sha1"]:
-            print(f"  warning: checkpoints/{exp.name}.pt has changed since these "
-                  f"results were written ({meta['checkpoint_sha1']} -> {digest})")
-
-
-def run_experiments(exp, only=None):
-    """Run pruning experiments on the saved base model.
-
-    only: subset of PRUNE_EXPERIMENTS keys (default: all). Results merge
-    into any existing results/<name>.json, so one experiment can be added
-    to a cached run without redoing the others. Each experiment is seeded
-    independently, so results don't depend on which subset ran.
-    """
-    keys = list(PRUNE_EXPERIMENTS) if only is None else list(only)
-    unknown = [k for k in keys if k not in PRUNE_EXPERIMENTS]
-    if unknown:
-        raise ValueError(f"unknown experiment(s) {unknown}; "
-                         f"choose from {list(PRUNE_EXPERIMENTS)}")
-
-    splits = load_splits(exp)
-    model = load_base_model(exp)
-    RESULTS_DIR.mkdir(exist_ok=True)
-    path = results_path(exp)
-    out = json.loads(path.read_text()) if path.exists() else {}
-    if out:
-        check_meta(exp, out)
-
-    durations = dict(out.get("_meta", {}).get("durations_s") or {})
-    for key in keys:
-        print(f"[{exp.name}] {key}...")
-        torch.manual_seed(SEED)
+    def timed(label, seed_offset, fn, *args, **kwargs):
+        torch.manual_seed(unit.seed * 1000 + seed_offset)
         start = time.perf_counter()
-        out[key] = PRUNE_EXPERIMENTS[key](model, splits, exp)
-        durations[key] = round(time.perf_counter() - start, 1)
+        out = fn(*args, **kwargs)
+        times[label] = round(time.perf_counter() - start, 1)
+        return out
 
-    out["_meta"] = _meta(exp, durations)
-    path.write_text(json.dumps(out, indent=2))
-    print(f"saved {path}")
-    return out
+    sweeps = {}
+    for i, (criterion, recompute) in enumerate(SWEEP_CRITERIA):
+        label = criterion + ("_recomputed" if recompute else "")
+        sweeps[label] = _columns(timed(f"sweep_{label}", i, sweep_no_retrain, model,
+                                       splits, criterion, unit, recompute=recompute))
+    retrain = {}
+    for i, criterion in enumerate(RETRAIN_CRITERIA):
+        retrain[criterion] = _columns(timed(f"retrain_{criterion}", 100 + i,
+                                            iterative_prune_retrain, model, splits, unit,
+                                            criterion))
+    overlap = timed("overlap", 200, overlap_analysis, model, splits, unit)
 
-
-def load_results(exp):
-    path = results_path(exp)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"{path} not found — run `python3 main.py --dataset {exp.name} --prune`")
-    return json.loads(path.read_text())
-
-
-def make_all_figures(exp, results=None, save=True):
-    """Draw every figure whose data is present. Missing ones are skipped."""
-    if results is None:
-        results = load_results(exp)
-    check_meta(exp, results)
-    FIGURES_DIR.mkdir(exist_ok=True)
-    drawn = {}
-    for name, fn in FIGURES.items():
-        fig = fn(results, exp)
-        if fig is None:
-            continue
-        drawn[name] = fig
-        if save:
-            path = FIGURES_DIR / f"{name}_{exp.name}.png"
-            fig.savefig(path, bbox_inches="tight")
-            print(f"saved {path}")
-    return drawn
+    return _json_safe({
+        "key": design.key(unit), "unit": dataclasses.asdict(unit),
+        "n_prunable": n_total, "n_params": count_free_parameters(model),
+        "base": base, "sweeps": sweeps, "retrain": retrain, "overlap": overlap,
+        "_meta": {"git_commit": git_commit(), "device": device,
+                  "gpu": torch.cuda.get_device_name() if device == "cuda" else None,
+                  "torch": torch.__version__, "duration_s": round(time.perf_counter() - t0, 1),
+                  "step_durations_s": times,
+                  "written": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}})
 
 
-def make_report(names):
-    """Rewrite the generated blocks of every brief from the cached results.
-    Datasets without results are listed as not yet run."""
-    results = {}
-    for name in names:
-        path = RESULTS_DIR / f"{name}.json"
-        if path.exists():
-            results[name] = json.loads(path.read_text())
+# --------------------------------------------------------------------------
+# The log: results/*.jsonl, one finished unit per line
+# --------------------------------------------------------------------------
+
+def load_log(path):
+    """Finished units, in file order. A truncated last line (a run killed
+    mid-write) is ignored."""
+    records = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return records
+
+
+def append_record(path, record):
+    RESULTS_DIR.mkdir(exist_ok=True)
+    text = path.read_text() if path.exists() else ""
+    prefix = "\n" if text and not text.endswith("\n") else ""
+    with open(path, "a") as f:
+        f.write(prefix + json.dumps(record, allow_nan=False) + "\n")
+        f.flush()
+
+
+def fmt_duration(seconds):
+    hours = seconds / 3600
+    return f"{hours:.1f} h" if hours >= 1 else f"{seconds / 60:.0f} min"
+
+
+# --------------------------------------------------------------------------
+# Running with a budget
+# --------------------------------------------------------------------------
+
+def run(units, path, device, budget_min=None):
+    records = load_log(path)
+    done_keys = {r["key"] for r in records}
+    pending = [u for u in design.ordered(units) if design.key(u) not in done_keys]
+    cost = design.CostModel(records)
+    deadline = time.monotonic() + budget_min * 60 if budget_min else None
+    print(f"{len(units) - len(pending)}/{len(units)} units done; {len(pending)} to go"
+          + (f"; budget {budget_min:g} min" if budget_min else "") + f"; device {device}")
+
+    ran = 0
+    try:
+        while pending:
+            left = deadline - time.monotonic() if deadline else float("inf")
+            pick = next((u for u in pending
+                         if (est := cost.estimate(u)) is None or est <= left), None)
+            if left <= 0 or pick is None:
+                print("budget used up; run again to continue")
+                break
+            pending.remove(pick)
+            label = (f"{pick.dataset}/{pick.arch} w{pick.width:g} data{pick.data_frac:g} "
+                     f"ep{pick.epochs} wd{pick.weight_decay:g} rt{pick.retrain_epochs} "
+                     f"seed{pick.seed}")
+            est = cost.estimate(pick)
+            print(f"[{ran + 1}] {label}" + (f"  (~{fmt_duration(est)})" if est else ""),
+                  flush=True)
+            record = run_unit(pick, device)
+            append_record(path, record)
+            cost.add(record)
+            ran += 1
+            print(f"    done in {fmt_duration(record['_meta']['duration_s'])}", flush=True)
         else:
-            print(f"  note: no {path} yet — its rows will be missing")
-    report.write_all(BRIEFS, report.render(results))
+            print("all units done")
+    except KeyboardInterrupt:
+        print("\ninterrupted; the unit in flight is lost, everything else is saved")
+    print(f"ran {ran} unit(s) this session")
+
+
+def status(units, block_keys, path):
+    records = load_log(path)
+    done = {r["key"] for r in records}
+    cost = design.CostModel(records)
+    print(f"{path.name}: {sum(design.key(u) in done for u in units)}/{len(units)} units done")
+    print("\nblock      done / total  (blocks overlap at the centre point)")
+    for block, keys in block_keys.items():
+        print(f"  {block:<9}{len(keys & done):>5} / {len(keys)}")
+    print("\nseed       done / total")
+    for seed in sorted({u.seed for u in units}):
+        keys = {design.key(u) for u in units if u.seed == seed}
+        print(f"  {seed:<9}{len(keys & done):>5} / {len(keys)}")
+    remaining = [u for u in units if design.key(u) not in done]
+    ests = [cost.estimate(u) for u in remaining]
+    known = [e for e in ests if e is not None]
+    if remaining:
+        print(f"\nremaining: {len(remaining)} units, est. {fmt_duration(sum(known))}"
+              + (f" (+ {len(ests) - len(known)} with no estimate yet)"
+                 if len(known) < len(ests) else ""))
 
 
 # --------------------------------------------------------------------------
-# Command line parsing
+# Command line
 # --------------------------------------------------------------------------
 
-def _coerce(value: str, current):
-    """Parse a --set value against the field's current value."""
+def _coerce(value, current):
     if value.lower() == "none":
         return None
     if isinstance(current, bool):
         return value.lower() in ("1", "true", "yes")
-    if isinstance(current, int) or current is None:  # None: int-or-None fields
+    if isinstance(current, int) or current is None:
         try:
             return int(value)
         except ValueError:
@@ -239,69 +228,59 @@ def _coerce(value: str, current):
     return value
 
 
-def configure(name, overrides=()):
-    """The named preset with --set overrides applied and its device resolved."""
-    exp = EXPERIMENTS[name]
-    fields = {}
-    for item in overrides:
+def parse_overrides(items):
+    template = Unit("mnist", "mlp", 1.0, 1.0, 1, 0.0, 1, 0)
+    out = {}
+    for item in items:
         field, _, value = item.partition("=")
-        if not hasattr(exp, field):
-            raise ValueError(f"unknown field {field!r}; choose from "
-                             f"{[f.name for f in dataclasses.fields(exp)]}")
-        fields[field] = _coerce(value, getattr(exp, field))
-    exp = dataclasses.replace(exp, **fields)
-    return dataclasses.replace(exp, device=resolve_device(exp.device))
+        if field not in OVERRIDABLE:
+            raise ValueError(f"cannot override {field!r}; choose from {list(OVERRIDABLE)}")
+        out[field] = _coerce(value, getattr(template, field))
+    return out
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--train", action="store_true", help="train the base model")
-    parser.add_argument("--prune", action="store_true", help="run the pruning experiments")
-    parser.add_argument("--plot", action="store_true", help="generate the figures")
-    parser.add_argument("--report", action="store_true",
-                        help="rewrite the generated blocks in RESULTS.md and ../README.md")
-    parser.add_argument("--notebook", action="store_true", help="execute obd.ipynb in place")
-    parser.add_argument("--dataset", nargs="+", choices=list(EXPERIMENTS),
-                        default=list(EXPERIMENTS), help="which experiments to run (default: all)")
-    parser.add_argument("--only", nargs="+", choices=list(PRUNE_EXPERIMENTS),
-                        help="prune stage: run only these experiments and merge "
-                             "them into the existing results/<name>.json")
-    parser.add_argument("--set", nargs="*", default=[], metavar="FIELD=VALUE",
-                        help="override Experiment fields, e.g. --set epochs=5 lr=3e-4")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--budget", type=float, metavar="MIN", help="stop starting units after MIN minutes")
+    p.add_argument("--design", nargs="+", choices=design.BLOCKS, default=list(design.BLOCKS))
+    p.add_argument("--seeds", type=int, help="seeds per unit (default 5; 2 with --smoke)")
+    p.add_argument("--dataset", nargs="+", choices=list(DATASETS))
+    p.add_argument("--arch", nargs="+", choices=list(ARCHS))
+    p.add_argument("--set", nargs="*", default=[], metavar="FIELD=VALUE")
+    p.add_argument("--device", default="auto")
+    p.add_argument("--smoke", action="store_true", help="tiny fast run into results/smoke.jsonl")
+    p.add_argument("--run", action="store_true", help="run units (the default unless a report flag is given)")
+    p.add_argument("--status", action="store_true", help="show progress and estimated time left")
+    p.add_argument("--tables", action="store_true", help="write summary CSVs to results/tables/")
+    p.add_argument("--plot", action="store_true", help="draw the figures")
+    args = p.parse_args()
 
-    if args.only:
-        args.prune = True  # --only alone means: run just those prune experiments
-    run_all = not (args.train or args.prune or args.plot or args.report or args.notebook)
-    try:  # every override is parsed and type-checked before the first stage starts
-        exps = [configure(name, args.set) for name in args.dataset]
+    try:
+        overrides = {**(SMOKE if args.smoke else {}), **parse_overrides(args.set)}
     except ValueError as err:
-        parser.error(str(err))
-    timings = []
+        p.error(str(err))
+    seeds = args.seeds or (2 if args.smoke else 5)
+    only = {"dataset": args.dataset, "arch": args.arch}
+    units = design.all_units(args.design, seeds, overrides, only)
+    path = RESULTS_DIR / ("smoke.jsonl" if args.smoke else "units.jsonl")
 
-    def timed(label, fn, *fn_args, **fn_kwargs):
-        start = time.perf_counter()
-        fn(*fn_args, **fn_kwargs)
-        timings.append((label, time.perf_counter() - start))
-
-    for exp in exps:
-        print(f"[{exp.name}] device: {exp.device}")
-        if args.train or run_all:
-            timed(f"{exp.name} train", train_base_model, exp)
-        if args.prune or run_all:
-            timed(f"{exp.name} prune", run_experiments, exp, only=args.only)
-        if args.plot or run_all:
-            timed(f"{exp.name} plot", make_all_figures, exp)
-    if args.report or run_all:
-        timed("report", make_report, list(EXPERIMENTS))
-    if args.notebook or run_all:
-        timed("notebook", report.execute_notebook, NOTEBOOK)
-
-    if timings:
-        print("\ntimings:")
-        for label, seconds in timings:
-            print(f"  {label:<16} {report.minutes(seconds)}")
+    reports = args.status or args.tables or args.plot
+    if args.run or not reports:
+        run(units, path, resolve_device(args.device), args.budget)
+    if args.status:
+        block_keys = {b: {design.key(u) for u in design.all_units([b], seeds, overrides, only)}
+                      for b in args.design}
+        status(units, block_keys, path)
+    if args.tables or args.plot:
+        import aggregate
+        units_df = aggregate.load(path)
+        if args.tables:
+            aggregate.write_tables(units_df, RESULTS_DIR / "tables")
+        if args.plot:
+            import figures
+            FIGURES_DIR.mkdir(exist_ok=True)
+            figures.make_all(units_df, FIGURES_DIR)
 
 
 if __name__ == "__main__":
