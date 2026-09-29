@@ -1,4 +1,20 @@
-# Pruning reproductions
+# Pruning Experiments
+
+**Pruning** is a class of regularization techniques that involve removing connections from ANNs. 
+This repo includes experiments scrutinizing two pruning techniques: *Optimal Brain Damage* and *Synaptic Pruning* 
+
+This repo is part of the **Neuro-AI lit review** on [My Weblog](https://jakeblackburn.dev/weblog/neuro-ai/).
+explanations of experiments and results for each technique can be found in their respective folders, 
+and a [full writeup](https://jakeblackburn.dev/weblog/neuro-ai/pruning_experiments) can be found at on my weblog.
+
+
+
+
+---
+
+
+
+> [!NOTE] The following is AI generated: 
 
 Two independent paper reproductions that share one Python environment. Each
 folder is self-contained: its own data loading, its own `main.py`, and its own
