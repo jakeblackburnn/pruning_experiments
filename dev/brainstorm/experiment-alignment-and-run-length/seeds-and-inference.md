@@ -49,7 +49,8 @@ cheap there: keep 5.
 
 ## Recommendation
 
-- OBD: 3 seeds for the trimmed grid if the budget allows, 2 otherwise; 5 seeds on the centre
-  points and the paper net (both cheap), which also measures the noise.
-- Synaptic: 5 seeds on the trimmed grid.
+- OBD: 3 seeds for the trimmed grid; 5 seeds on the centre points and the paper net (both cheap),
+  run first, which also measures the noise.
+- Synaptic: 5 seeds on the trimmed grid if the budget allows, else 4 (see the budget table in
+  [index.md](index.md)).
 - Report t-intervals; drop the Wilcoxon column or keep it only for cells with 6+ seeds.
