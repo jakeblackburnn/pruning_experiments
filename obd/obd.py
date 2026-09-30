@@ -353,6 +353,11 @@ def diagonal_hessian(model, x, loss="mse", batch_size=None, max_samples=None,
     was_training = model.training
     model.eval()  # BatchNorm must use its running statistics for the Jacobians
     try:
+        # vmap(jacrev) through BatchNorm aborts the whole process on MPS (a
+        # Metal assertion, not a catchable error), so those models go to the CPU.
+        if x.device.type == "mps" and any(isinstance(m, nn.modules.batchnorm._BatchNorm)
+                                          for m in model.modules()):
+            return _cpu_hessian(model, x, params, buffers, loss, batch_size, n_outputs)
         return _hessian_pass(model, x, params, buffers, loss, batch_size, n_outputs)
     except (RuntimeError, NotImplementedError) as err:
         # torch.func coverage on MPS is incomplete; the diagonal is worth an
@@ -360,19 +365,23 @@ def diagonal_hessian(model, x, loss="mse", batch_size=None, max_samples=None,
         if x.device.type != "mps":
             raise
         print(f"  warning: Hessian pass failed on mps ({err}); retrying on cpu")
-        device = x.device
-        cpu_model = model.to("cpu")
-        try:
-            h = _hessian_pass(
-                cpu_model, x.to("cpu"),
-                {name: p.to("cpu") for name, p in params.items()},
-                {name: b.to("cpu") for name, b in buffers.items()},
-                loss, batch_size, n_outputs)
-        finally:
-            model.to(device)
-        return {name: value.to(device) for name, value in h.items()}
+        return _cpu_hessian(model, x, params, buffers, loss, batch_size, n_outputs)
     finally:
         model.train(was_training)
+
+
+def _cpu_hessian(model, x, params, buffers, loss, batch_size, n_outputs):
+    device = x.device
+    cpu_model = model.to("cpu")
+    try:
+        h = _hessian_pass(
+            cpu_model, x.to("cpu"),
+            {name: p.to("cpu") for name, p in params.items()},
+            {name: b.to("cpu") for name, b in buffers.items()},
+            loss, batch_size, n_outputs)
+    finally:
+        model.to(device)
+    return {name: value.to(device) for name, value in h.items()}
 
 
 def saliencies(model, x, loss="mse", max_samples=None, names=None):
