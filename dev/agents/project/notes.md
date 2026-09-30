@@ -6,7 +6,7 @@
 - Log files hold per-device results: `obd/results/units.jsonl` mixes Mac (MPS) and later GPU runs by unit key.
 
 ## Budget: whole suite (OBD + synaptic) must run in < 8 h on the RTX 5080 (user, 2026-09-30)
-- Now: OBD full grid ≈ 81 h remaining at CUDA speed (1731 of 1830 units, 5 seeds; ≈ 20 h per seed). Synaptic: 5760 runs, no timing yet (`--budget 5` first to fill the cost model). Aim ≈ 4 h each; OBD needs a ~15× cut per seed, so fewer seeds alone will not do it.
+- Now: OBD full grid ≈ 81 h remaining at CUDA speed (1731 of 1830 units, 5 seeds; ≈ 20 h per seed). Synaptic: 5760 runs; a 5 min run did 84 runs (median 1.4 s lstm, 1.7 s cnn, 3.2 s transformer, mean 6 s, max 40 s), so the full grid ≈ 5.5 h (+120 runs unestimated; estimate from 84 shuffled seed-0 runs, transformer at ep60 dominates the tail). Aim ≈ 4 h each; OBD needs a ~15× cut per seed, so fewer seeds alone will not do it.
 - Where OBD time goes (99 units, mixed Mac/GPU): cifar10/resnet, cifar10/vgg and fmnist/resnet are ~80% of unit time (median 2.5–3.3 min, up to 20 min); the six other combos are 8–50 s. Cut there first.
 - Shrink without weakening conclusions:
   1. Pair, don't replicate: OBD compares saliency vs magnitude on the same trained net, so effects are paired within a unit and 3 seeds is enough. Keep 5 seeds only for the centre point and the headline (cifar10/resnet).

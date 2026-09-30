@@ -46,3 +46,13 @@
 - Scratchpad `obd_run.log` holds the run log; the Bash background task for `nohup` reports "completed" when the launcher shell exits, not the run.
 ### Pointers
 - `dev/agents/project/notes.md` (budget and shrink plan), `obd/design.py:34-62` (blocks), `synaptic_pruning/design.py` `block_units`, `dev/agents/DECISIONS.md`
+
+## Close (addendum) · 2026-09-30 13:05 · a6729f9..HEAD
+- **changed:** ran `synaptic_pruning/main.py --budget 5` on CUDA: 84 of 5760 runs in `synaptic_pruning/results/runs.jsonl` (seed 0); timing added to `dev/agents/project/notes.md`
+- **why:** timing base for the 8 h budget; synaptic had no cost model
+- **verified:** `main.py --budget 5` → "ran 84 run(s) this session"; `--status` → est. 5.5 h left (+120 runs with no estimate). Not verified: tables/figures for synaptic; the estimate is from only 84 shuffled runs (transformer/ep60 tail is thinly sampled)
+- **by:** claude
+- Synaptic full grid ≈ 5.5 h, OBD ≈ 81 h remaining: the budget cut is needed mostly on OBD; synaptic needs about a 2× trim (e.g. 3 seeds ≈ 3.3 h) to fit next to a ≈ 4 h OBD.
+- ⚠ uncommitted: `obd/results/smoke.jsonl`
+### Next
+1. Unchanged from the Close above; step 2 (synaptic timing) is done.
