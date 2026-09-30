@@ -1,2 +1,0 @@
-dataset,arch,width,data_frac,epochs,weight_decay,retrain_epochs,seed,n_prunable,n_params,duration_s,base_keep,base_train_loss,base_train_acc,base_val_loss,base_val_acc,base_test_loss,base_test_acc,epoch_mult,retrain_mult,default_wd,model
-fmnist,mlp,0.5,0.1,10,0.0001,2,0,50432,50698,9.4,1.0,0.411569,0.844444,0.488453,0.815,0.52046,0.8053,0.333,1.0,True,fmnist/mlp

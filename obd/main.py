@@ -1,23 +1,24 @@
 """Optimal Brain Damage at modern scales: a budgetable, resumable factorial run.
 
-    python3 main.py --budget 60      run for about an hour, then stop
+    python3 main.py --design centre  run the centre points first (5 seeds)
+    python3 main.py --budget 60      run for an hour, then stop
     python3 main.py --budget 600     ...run again to continue: finished units are skipped
     python3 main.py                  run everything that is left
-    python3 main.py --status         progress per block and seed, time left
+    python3 main.py --status         progress per block and seed
     python3 main.py --tables         summary CSVs  -> results/tables/
     python3 main.py --plot           figures       -> figures/
 
 The design (design.py) is a list of units: one trained network plus every
 pruning experiment on it. Each finished unit is appended as one JSON line to
 results/units.jsonl (the resume state: a unit is done once its line exists).
-Units run seed-major, so any stop leaves complete seeds and a balanced design;
-a unit expected to overrun the remaining budget is not started. Ctrl-C loses
-at most the unit in flight.
+Units run seed-major, so any stop leaves complete seeds and a balanced design.
+When the budget runs out the unit in flight is cut off and runs again next
+time; with --finish it completes first. Ctrl-C loses at most the unit in flight.
 
 Design selection:
 
-    --design core scale retrain   blocks to run (default: all; see design.py)
-    --seeds N                     seeds per unit (default 5)
+    --design core scale retrain centre   blocks to run (default: all; see design.py)
+    --seeds N                     seeds for every block (default: design.SEEDS)
     --dataset mnist cifar10 ...   restrict the design
     --arch paper mlp vgg resnet   restrict the design
     --set FIELD=VALUE ...         override Unit fields (hessian_samples, epochs, ...)
@@ -30,6 +31,7 @@ import argparse
 import dataclasses
 import datetime
 import json
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -99,7 +101,9 @@ def run_unit(unit, device):
         sweeps[label] = _columns(timed(f"sweep_{label}", i, sweep_no_retrain, model,
                                        splits, criterion, unit, recompute=recompute))
     retrain = {}
-    for i, criterion in enumerate(RETRAIN_CRITERIA):
+    for criterion in unit.retrain_criteria:
+        # the seed follows the criterion, not its position in this unit's list
+        i = RETRAIN_CRITERIA.index(criterion)
         retrain[criterion] = _columns(timed(f"retrain_{criterion}", 100 + i,
                                             iterative_prune_retrain, model, splits, unit,
                                             criterion))
@@ -151,47 +155,54 @@ def fmt_duration(seconds):
 # Running with a budget
 # --------------------------------------------------------------------------
 
-def run(units, path, device, budget_min=None):
-    records = load_log(path)
-    done_keys = {r["key"] for r in records}
+class OutOfBudget(BaseException):
+    """Raised by the budget timer; a BaseException, like KeyboardInterrupt, so
+    no `except Exception` inside a unit can swallow it."""
+
+
+def _out_of_budget(signum, frame):
+    raise OutOfBudget
+
+
+def run(units, path, device, budget_min=None, finish=False):
+    """Run the pending units in order until the budget is spent. The unit in
+    flight at the deadline is cut off (a timer signal), unless `finish`."""
+    done_keys = {r["key"] for r in load_log(path)}
     pending = [u for u in design.ordered(units) if design.key(u) not in done_keys]
-    cost = design.CostModel(records)
     deadline = time.monotonic() + budget_min * 60 if budget_min else None
     print(f"{len(units) - len(pending)}/{len(units)} units done; {len(pending)} to go"
           + (f"; budget {budget_min:g} min" if budget_min else "") + f"; device {device}")
+    signal.signal(signal.SIGALRM, _out_of_budget)
 
     ran = 0
     try:
-        while pending:
-            left = deadline - time.monotonic() if deadline else float("inf")
-            pick = next((u for u in pending
-                         if (est := cost.estimate(u)) is None or est <= left), None)
-            if left <= 0 or pick is None:
+        for unit in pending:
+            if deadline and time.monotonic() >= deadline:
                 print("budget used up; run again to continue")
                 break
-            pending.remove(pick)
-            label = (f"{pick.dataset}/{pick.arch} w{pick.width:g} data{pick.data_frac:g} "
-                     f"ep{pick.epochs} wd{pick.weight_decay:g} rt{pick.retrain_epochs} "
-                     f"seed{pick.seed}")
-            est = cost.estimate(pick)
-            print(f"[{ran + 1}] {label}" + (f"  (~{fmt_duration(est)})" if est else ""),
-                  flush=True)
-            record = run_unit(pick, device)
+            print(f"[{ran + 1}] {unit.dataset}/{unit.arch} w{unit.width:g} "
+                  f"data{unit.data_frac:g} ep{unit.epochs} wd{unit.weight_decay:g} "
+                  f"rt{unit.retrain_epochs} seed{unit.seed}", flush=True)
+            if deadline and not finish:
+                signal.setitimer(signal.ITIMER_REAL, max(deadline - time.monotonic(), 1e-3))
+            try:
+                record = run_unit(unit, device)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
             append_record(path, record)
-            cost.add(record)
             ran += 1
             print(f"    done in {fmt_duration(record['_meta']['duration_s'])}", flush=True)
         else:
             print("all units done")
+    except OutOfBudget:
+        print("budget used up; the unit in flight was cut off, run again to continue")
     except KeyboardInterrupt:
         print("\ninterrupted; the unit in flight is lost, everything else is saved")
     print(f"ran {ran} unit(s) this session")
 
 
 def status(units, block_keys, path):
-    records = load_log(path)
-    done = {r["key"] for r in records}
-    cost = design.CostModel(records)
+    done = {r["key"] for r in load_log(path)}
     print(f"{path.name}: {sum(design.key(u) in done for u in units)}/{len(units)} units done")
     print("\nblock      done / total  (blocks overlap at the centre point)")
     for block, keys in block_keys.items():
@@ -200,13 +211,6 @@ def status(units, block_keys, path):
     for seed in sorted({u.seed for u in units}):
         keys = {design.key(u) for u in units if u.seed == seed}
         print(f"  {seed:<9}{len(keys & done):>5} / {len(keys)}")
-    remaining = [u for u in units if design.key(u) not in done]
-    ests = [cost.estimate(u) for u in remaining]
-    known = [e for e in ests if e is not None]
-    if remaining:
-        print(f"\nremaining: {len(remaining)} units, est. {fmt_duration(sum(known))}"
-              + (f" (+ {len(ests) - len(known)} with no estimate yet)"
-                 if len(known) < len(ests) else ""))
 
 
 # --------------------------------------------------------------------------
@@ -242,16 +246,19 @@ def parse_overrides(items):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--budget", type=float, metavar="MIN", help="stop starting units after MIN minutes")
+    p.add_argument("--budget", type=float, metavar="MIN",
+                   help="stop after MIN minutes, cutting off the unit in flight")
+    p.add_argument("--finish", action="store_true",
+                   help="when the budget runs out, let the unit in flight finish")
     p.add_argument("--design", nargs="+", choices=design.BLOCKS, default=list(design.BLOCKS))
-    p.add_argument("--seeds", type=int, help="seeds per unit (default 5; 2 with --smoke)")
+    p.add_argument("--seeds", type=int, help="seeds for every block (default design.SEEDS; 2 with --smoke)")
     p.add_argument("--dataset", nargs="+", choices=list(DATASETS))
     p.add_argument("--arch", nargs="+", choices=list(ARCHS))
     p.add_argument("--set", nargs="*", default=[], metavar="FIELD=VALUE")
     p.add_argument("--device", default="auto")
     p.add_argument("--smoke", action="store_true", help="tiny fast run into results/smoke.jsonl")
     p.add_argument("--run", action="store_true", help="run units (the default unless a report flag is given)")
-    p.add_argument("--status", action="store_true", help="show progress and estimated time left")
+    p.add_argument("--status", action="store_true", help="show progress per block and seed")
     p.add_argument("--tables", action="store_true", help="write summary CSVs to results/tables/")
     p.add_argument("--plot", action="store_true", help="draw the figures")
     args = p.parse_args()
@@ -260,14 +267,14 @@ def main():
         overrides = {**(SMOKE if args.smoke else {}), **parse_overrides(args.set)}
     except ValueError as err:
         p.error(str(err))
-    seeds = args.seeds or (2 if args.smoke else 5)
+    seeds = args.seeds or (2 if args.smoke else None)
     only = {"dataset": args.dataset, "arch": args.arch}
     units = design.all_units(args.design, seeds, overrides, only)
     path = RESULTS_DIR / ("smoke.jsonl" if args.smoke else "units.jsonl")
 
     reports = args.status or args.tables or args.plot
     if args.run or not reports:
-        run(units, path, resolve_device(args.device), args.budget)
+        run(units, path, resolve_device(args.device), args.budget, args.finish)
     if args.status:
         block_keys = {b: {design.key(u) for u in design.all_units([b], seeds, overrides, only)}
                       for b in args.design}

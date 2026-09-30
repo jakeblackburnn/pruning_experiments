@@ -27,6 +27,7 @@ class Unit:
     weight_decay: float
     retrain_epochs: int     # retraining between pruning steps
     seed: int
+    retrain_criteria: tuple[str, ...] = ()   # prune-retrain loops to run (design.py)
     hessian_samples: int = 1024   # subsample for the diagonal Hessian
     n_cap: int | None = None      # cap on training samples (smoke tests)
     lr: float = 1e-3

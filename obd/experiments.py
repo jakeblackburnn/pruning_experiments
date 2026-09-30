@@ -6,7 +6,9 @@
                             and where does the curvature term carry information?
 
 All experiments visit the same `FRACTIONS` of the prunable weights, so curves
-from different architectures and datasets share a grid. The core math (models,
+from different architectures and datasets share a grid. The prune-retrain loop
+takes fewer, larger steps (`RETRAIN_FRACTIONS`, a subset): it is most of a
+unit's time, and above 8% kept the criteria do not differ. The core math (models,
 diagonal Hessian, saliencies, mask primitives) lives in obd.py.
 """
 
@@ -20,6 +22,7 @@ from obd import (apply_masks, diagonal_hessian, evaluate, flatten, initial_masks
 
 # fractions of the prunable weights kept, in the order they are visited
 FRACTIONS = (0.7, 0.5, 0.35, 0.25, 0.18, 0.12, 0.08, 0.05, 0.03, 0.02, 0.01, 0.005)
+RETRAIN_FRACTIONS = (0.5, 0.25, 0.12, 0.05, 0.02, 0.01, 0.005)
 
 # criteria run in each experiment
 SWEEP_CRITERIA = (("magnitude", False), ("random", False), ("taylor", False),
@@ -32,9 +35,9 @@ def _r(x):
     return round(float(x), 6)
 
 
-def sweep_targets(n_total):
+def sweep_targets(n_total, fractions=FRACTIONS):
     """Weight counts to prune down to, largest first (all < n_total)."""
-    counts = [max(1, round(f * n_total)) for f in FRACTIONS]
+    counts = [max(1, round(f * n_total)) for f in fractions]
     out = []
     for n in counts:
         if n < n_total and (not out or n < out[-1]):
@@ -51,10 +54,10 @@ def _setup(model):
     return pruned, names, masks, n_total
 
 
-def _point(model, splits, unit, n_remaining, n_total):
-    """Train/val/test loss and accuracy for one pruning level."""
+def _point(model, splits, unit, n_remaining, n_total, which=("train", "val", "test")):
+    """Loss and accuracy on the `which` splits for one pruning level."""
     point = {"remaining": n_remaining, "keep": _r(n_remaining / n_total)}
-    for split in ("train", "val", "test"):
+    for split in which:
         x, y, labels = splits[split]
         loss, acc = evaluate(model, x, y, labels, unit.loss)
         point[f"{split}_loss"], point[f"{split}_acc"] = _r(loss), _r(acc)
@@ -120,11 +123,11 @@ def iterative_prune_retrain(model, splits, unit, rank_by="saliency"):
     model, names, masks, n_total = _setup(model)
 
     results = [_point(model, splits, unit, n_total, n_total)]
-    for n_remaining in sweep_targets(n_total):
+    for n_remaining in sweep_targets(n_total, RETRAIN_FRACTIONS):
         scores = scores_for(model, (x_tr, y_tr), rank_by, unit)
         masks = prune_to(masks, scores, n_remaining, names)
         apply_masks(model, masks)
-        pre = _point(model, splits, unit, n_remaining, n_total)
+        pre = _point(model, splits, unit, n_remaining, n_total, which=("val", "test"))
         train(model, x_tr, y_tr, unit, epochs=unit.retrain_epochs, masks=masks)
         point = _point(model, splits, unit, n_remaining, n_total)
         for k in ("val_loss", "val_acc", "test_loss", "test_acc"):

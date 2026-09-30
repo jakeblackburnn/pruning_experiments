@@ -1,4 +1,4 @@
-"""Analysis of results/*.jsonl: tidy frames, summary statistics, paired tests.
+"""Analysis of results/*.jsonl: tidy frames, summary statistics, paired contrasts.
 
     data = load(path)       -> Data(units, curves, overlap, overlap_curves)
     write_tables(data, dir) -> CSVs under results/tables/
@@ -110,35 +110,11 @@ def summarize(df, by, values):
     return pd.DataFrame(out).reset_index()
 
 
-def holm(pvalues):
-    """Holm step-down adjustment; NaNs stay NaN."""
-    p = np.asarray(pvalues, dtype=float)
-    out = np.full_like(p, np.nan)
-    ok = np.where(~np.isnan(p))[0]
-    order = ok[np.argsort(p[ok])]
-    running = 0.0
-    for rank, i in enumerate(order):
-        running = max(running, (len(order) - rank) * p[i])
-        out[i] = min(1.0, running)
-    return out
-
-
-def _wilcoxon(x):
-    x = np.asarray(x, dtype=float)
-    x = x[~np.isnan(x)]
-    if len(x) < 2 or np.all(x == 0):
-        return np.nan
-    try:
-        return stats.wilcoxon(x).pvalue
-    except ValueError:
-        return np.nan
-
-
 def paired(curves, kind, contrasts, value, by):
     """For each (a, b) in `contrasts`: the paired difference a - b of `value`,
     summarised over seeds within each group of `by` (columns of `curves`,
-    which must include "keep"). Reports mean, CI, seeds, the Wilcoxon p
-    across seeds, and its Holm adjustment over all rows returned."""
+    which must include "keep"). Reports mean, CI and seeds. No p-value: with
+    the few seeds here a signed-rank test cannot reach 0.05."""
     df = curves[curves["kind"] == kind]
     keys = CONFIG + ["seed", "keep"]
     wide = df.pivot_table(index=keys, columns="criterion", values=value)
@@ -151,15 +127,13 @@ def paired(curves, kind, contrasts, value, by):
         per_seed = diff.groupby(by + ["seed"], dropna=False)["diff"].mean().reset_index()
         g = per_seed.groupby(by, dropna=False)["diff"]
         out = pd.DataFrame({"mean_diff": g.mean(), "ci": g.apply(ci95),
-                            "n_seeds": g.count(), "p": g.apply(_wilcoxon)}).reset_index()
+                            "n_seeds": g.count()}).reset_index()
         out.insert(0, "contrast", f"{a} - {b}")
         out.insert(1, "metric", value)
         rows.append(out)
     if not rows:
         return pd.DataFrame()
-    out = pd.concat(rows, ignore_index=True)
-    out["p_holm"] = holm(out["p"])
-    return out
+    return pd.concat(rows, ignore_index=True)
 
 
 def variance_explained(df, value, factors):

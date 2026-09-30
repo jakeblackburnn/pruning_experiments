@@ -80,7 +80,8 @@ def paired_heatmap(data):
         return None
     d["row"] = d["model"] + "  w" + d["width"].astype(str)
     table = d.pivot(index="row", columns="keep", values="mean_diff")
-    sig = d.pivot(index="row", columns="keep", values="p_holm") < 0.05
+    sig = d.pivot(index="row", columns="keep", values="mean_diff").abs() > \
+        d.pivot(index="row", columns="keep", values="ci")
     fig, ax = plt.subplots(figsize=(1 + 0.6 * table.shape[1], 0.32 * table.shape[0] + 1.5))
     lim = np.nanmax(np.abs(table.values)) or 1
     im = ax.imshow(table.values, cmap="RdBu", vmin=-lim, vmax=lim, aspect="auto")
@@ -92,7 +93,7 @@ def paired_heatmap(data):
                 ax.text(j, i, "*", ha="center", va="center", fontsize=9)
     ax.set_xlabel("fraction of weights kept")
     fig.colorbar(im, label="test acc: OBD - magnitude (retrained)")
-    ax.set_title("* = Holm-adjusted Wilcoxon p < 0.05 across seeds", fontsize=9)
+    ax.set_title("* = 95% t-interval across seeds excludes 0", fontsize=9)
     fig.tight_layout()
     return fig
 

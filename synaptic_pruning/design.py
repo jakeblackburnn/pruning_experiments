@@ -4,13 +4,15 @@ A run is a `Unit`: one model trained under one method. Axes: dataset, arch,
 width (model size), train_frac (data), epochs (compute), seq_len, method and
 the method's own parameters; seeds are the blocking factor.
 
-Three blocks, each crossed within itself, overlapping where they coincide
-(deduplicated by key):
+Three blocks, overlapping where they coincide (deduplicated by key):
 
   core   dataset x arch x seq_len x method    at the default width, data, epochs
-  scale  dataset x arch x width x train_frac x epochs x method
-                                              for a subset of archs and methods
-  sweep  dataset x arch x method parameters   pruning smin x smax x horizon,
+  scale  dataset x SCALE_ARCHS x a star around the centre (width, train_frac,
+         epochs one at a time) x SCALE_METHODS; width x method is crossed,
+         which is the interaction the scale question asks about, and
+         random_pruning runs along width as the capacity control
+  sweep  dataset x arch x method parameters   6 pruning variants (the paper's,
+                                              one factor off it, one corner),
                                               dropout rate, weight decay
 
 `ordered()` yields every unit of seed 0, then seed 1, ..., shuffled within a
@@ -21,20 +23,20 @@ import dataclasses
 import hashlib
 import json
 import random
-import statistics
 
 from datasets import DATASETS
 from models import ARCHS
 from train import Unit
 
 BASE_EPOCHS, BASE_WIDTH, BASE_SEQ = 20, 64, 14
-SEQ_LENS = (1, 14, 60)
+SEQ_LENS = (14, 60)
 WIDTHS = (16, 64, 256)
-TRAIN_FRACS = (0.1, 0.3, 1.0)
-EPOCH_MULTS = (0.5, 1.0, 3.0)
+TRAIN_FRACS = (0.1, 0.3)       # off-centre levels of the scale star
+EPOCH_MULTS = (0.5, 3.0)
 SCALE_ARCHS = ("lstm", "cnn", "transformer")
 SWEEP_ARCHS = ("lstm", "cnn")
 BLOCKS = ("core", "scale", "sweep")
+SEEDS = 4
 
 # name -> the method-specific fields; the defaults of the paper's setting
 CORE_METHODS = {
@@ -57,12 +59,16 @@ def block_units(block, seed):
         return [_unit(d, a, seed, m, seq_len=s) for d in DATASETS for a in ARCHS
                 for s in SEQ_LENS for m in CORE_METHODS]
     if block == "scale":
-        return [_unit(d, a, seed, m, width=w, train_frac=f, epoch_mult=e)
-                for d in DATASETS for a in SCALE_ARCHS for w in WIDTHS
-                for f in TRAIN_FRACS for e in EPOCH_MULTS for m in SCALE_METHODS]
+        return ([_unit(d, a, seed, m, width=w) for d in DATASETS for a in SCALE_ARCHS
+                 for w in WIDTHS for m in SCALE_METHODS + ("random_pruning",)]
+                + [_unit(d, a, seed, m, train_frac=f) for d in DATASETS for a in SCALE_ARCHS
+                   for f in TRAIN_FRACS for m in SCALE_METHODS]
+                + [_unit(d, a, seed, m, epoch_mult=e) for d in DATASETS for a in SCALE_ARCHS
+                   for e in EPOCH_MULTS for m in SCALE_METHODS])
     if block == "sweep":
         variants = [("pruning", {"smin": lo, "smax": hi, "horizon": h})
-                    for lo in (0.0, 0.3) for hi in (0.5, 0.7, 0.9) for h in (0, 10)]
+                    for lo, hi, h in ((0.3, 0.7, 0), (0.0, 0.7, 0), (0.3, 0.5, 0),
+                                      (0.3, 0.9, 0), (0.3, 0.7, 10), (0.0, 0.9, 10))]
         variants += [("dropout", {"dropout": p}) for p in (0.1, 0.5)]
         variants += [("l2", {"weight_decay": w}) for w in (1e-4, 1e-2)]
         return [_unit(d, a, seed, m, params) for d in DATASETS for a in SWEEP_ARCHS
@@ -102,35 +108,3 @@ def ordered(units):
         random.Random(seed).shuffle(chunk)
         out.extend(chunk)
     return out
-
-
-class CostModel:
-    """Expected seconds per unit, learned from completed records.
-
-    The estimate is the median duration of finished units with the same
-    (dataset, arch, width), scaled by train_frac * epochs (the work per unit);
-    it falls back to the same (dataset, arch), then to None (unknown).
-    """
-
-    def __init__(self, records=()):
-        self.by_group, self.by_arch = {}, {}
-        for r in records:
-            self.add(r)
-
-    @staticmethod
-    def _work(u):
-        return u.train_frac * u.epochs
-
-    def add(self, record):
-        u, d = Unit(**record["unit"]), record["_meta"]["duration_s"]
-        self.by_group.setdefault((u.dataset, u.arch, u.width), []).append((self._work(u), d))
-        self.by_arch.setdefault((u.dataset, u.arch), []).append((self._work(u), d))
-
-    def estimate(self, unit):
-        for peers in (self.by_group.get((unit.dataset, unit.arch, unit.width)),
-                      self.by_arch.get((unit.dataset, unit.arch))):
-            if peers:
-                # duration per unit of work, so a median over mixed work is fair
-                per_work = statistics.median(d / max(w, 1e-9) for w, d in peers)
-                return per_work * self._work(unit)
-        return None

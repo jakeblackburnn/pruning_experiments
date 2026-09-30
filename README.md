@@ -31,8 +31,8 @@ you like. Runs go seed by seed, so stopping at any time leaves a balanced design
 ```sh
 cd obd                          # or synaptic_pruning
 python3 main.py --smoke         # a tiny end-to-end check
-python3 main.py --status        # progress and estimated time left
-python3 main.py --budget 60     # run for about an hour, then stop
+python3 main.py --status        # progress per block and seed
+python3 main.py --budget 60     # run for an hour, then stop
 python3 main.py --tables --plot # summary CSVs and figures from what has finished
 ```
 
@@ -41,15 +41,15 @@ python3 main.py --tables --plot # summary CSVs and figures from what has finishe
 ### Recap: running the experiments
 
 1. **Check it works** (a minute or two): `python3 main.py --smoke --seeds 1`. This writes to `results/smoke.jsonl`, which is git-ignored.
-2. **Size the run:** do a short real run such as `python3 main.py --budget 5`, then `python3 main.py --status`. It prints done/total per block and seed, and the estimated time left, learned from the runs finished so far. If the total is too big, trim the blocks in `design.py`.
-3. **Run in slices:** `python3 main.py --budget 600` (minutes), as many times as you like. A run that would overrun the remaining budget is not started. Ctrl-C loses only the run in flight. The log is `results/units.jsonl` (obd) or `results/runs.jsonl` (synaptic_pruning); a run is done once its line exists, so re-running the same command continues where it stopped.
+2. **OBD: centre points first:** `python3 main.py --design centre` runs every model at the centre of the design with 5 seeds, which measures the seed-to-seed noise.
+3. **Run in slices:** `python3 main.py --budget 600` (minutes), as many times as you like. When the budget runs out the run in flight is cut off and runs again next time; add `--finish` to let it complete first. Ctrl-C loses only the run in flight. `python3 main.py --status` prints done/total per block and seed. The log is `results/units.jsonl` (obd) or `results/runs.jsonl` (synaptic_pruning); a run is done once its line exists, so re-running the same command continues where it stopped.
 4. **Look at partial results any time:** `python3 main.py --tables --plot` writes `results/tables/*.csv` and `figures/*.png` from whatever has finished.
 
 Selecting part of the design (the same flags for `--budget`, `--status`, `--tables`):
 
 ```sh
-python3 main.py --design core scale     # blocks (obd: core scale retrain; synaptic_pruning: core scale sweep)
-python3 main.py --seeds 10              # seeds per configuration (default 5); more seeds append
+python3 main.py --design core scale     # blocks (obd: core scale retrain centre; synaptic_pruning: core scale sweep)
+python3 main.py --seeds 10              # seeds for every block (default: SEEDS in design.py); more seeds append
 python3 main.py --dataset cifar10 --arch vgg resnet     # restrict the design (synaptic_pruning also has --method)
 python3 main.py --set hessian_samples=512               # override a Unit field (see OVERRIDABLE in main.py)
 python3 main.py --device cpu            # pin the device

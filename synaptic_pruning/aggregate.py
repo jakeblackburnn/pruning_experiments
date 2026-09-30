@@ -10,9 +10,9 @@ by (configuration, seed): positive = better than the baseline.
 
 Seeds are the blocking factor. A summary over a factor first averages the
 paired improvements within each seed over every setting it marginalises over,
-so the replicates in every interval and test are seeds, never the dependent
-cells of one seed. Intervals are 95% t-intervals; p-values are two-sided
-Wilcoxon signed-rank across seeds, Holm-adjusted within each table.
+so the replicates in every interval are seeds, never the dependent cells of
+one seed. Intervals are 95% t-intervals. The Friedman table's p-values are
+Holm-adjusted within the table.
 """
 
 import json
@@ -106,17 +106,6 @@ def holm(pvalues):
     return out
 
 
-def _wilcoxon(x):
-    x = np.asarray(x, dtype=float)
-    x = x[~np.isnan(x)]
-    if len(x) < 2 or np.all(x == 0):
-        return np.nan
-    try:
-        return stats.wilcoxon(x).pvalue
-    except ValueError:
-        return np.nan
-
-
 def improvements(runs, baseline="none", value="test_mae"):
     """Paired improvement of every other variant over `baseline`, per
     (configuration, seed): 100 * (baseline - variant) / baseline, plus the raw
@@ -130,15 +119,12 @@ def improvements(runs, baseline="none", value="test_mae"):
 
 
 def summarize(imp, by, value="improvement_pct"):
-    """Mean improvement per group of `by`, with the CI and a Wilcoxon test
-    across seeds after averaging within a seed over everything else."""
+    """Mean improvement per group of `by`, with the CI across seeds after
+    averaging within a seed over everything else."""
     per_seed = imp.groupby(by + ["seed"], dropna=False)[value].mean().reset_index()
     g = per_seed.groupby(by, dropna=False)[value]
-    out = pd.DataFrame({"mean": g.mean(), "ci": g.apply(ci95), "n_seeds": g.count(),
-                        "wins": g.apply(lambda x: float((x > 0).mean())),
-                        "p": g.apply(_wilcoxon)}).reset_index()
-    out["p_holm"] = holm(out["p"])
-    return out
+    return pd.DataFrame({"mean": g.mean(), "ci": g.apply(ci95), "n_seeds": g.count(),
+                         "wins": g.apply(lambda x: float((x > 0).mean()))}).reset_index()
 
 
 def contrast(runs, a, b, value="test_mae"):
