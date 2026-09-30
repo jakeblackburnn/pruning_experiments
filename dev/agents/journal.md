@@ -1,83 +1,62 @@
-# Journal · 2026-09-30 · main · 8be767f
+# Journal · 2026-09-30 · obd-results · 234016c
 ## Start
-Previous session: `/brainstorm` priced trimmed designs (`dev/brainstorm/experiment-alignment-and-run-length/index.md`, "Recommended shape", ≈ 7 h). Its three open questions are now answered (see the task below). This session frames the rework of both designs to fit the 8 h budget.
+Previous session reworked both designs for the 8 h budget (D8) and recorded Next: run `--design centre` first. This session runs a 40 min slice of OBD on a new branch.
 
 Carried forward:
-- Next: measure two concurrent GPU processes (disjoint `--dataset`) for throughput; decide keep/delete `backup/laptop-main`.
-- Traps: SSH to GitHub fails here (`Permission denied (publickey)`); `obd/results/smoke.jsonl` is tracked though git-ignored and currently modified; `obd/results/tables/` is stale.
-- Pointers: `obd/experiments.py` `iterative_prune_retrain`; `obd/design.py` `block_units`; `synaptic_pruning/design.py` `block_units`; `dev/agents/DECISIONS.md` D6, D7.
+- Next: from centre results, check seeds needed and compare retrain tail Δ with the pilot (`8be767f:obd/results/units.jsonl`); two-process GPU test; decide keep/delete `backup/laptop-main`.
+- Traps: SSH to GitHub fails here (`Permission denied (publickey)`); `obd/results/smoke.jsonl` is tracked though git-ignored; run from the project dir with `.venv/bin/python` by absolute path.
+- Pointers: `obd/main.py` `run`; `obd/design.py` `SEEDS`; `dev/agents/DECISIONS.md` D8.
 
-## Task: Rework OBD and synaptic designs for the 8 h budget · 14:01
-**Goal:** both designs answer Q1–Q3 of `dev/main.md` within ≈ 8 h on the RTX 5080, with a simple budget runner that stops where told and resumes.
+## Task: 40 min OBD budget run on branch `obd-results` · 15:05
+**Goal:** collect a first slice of v2 OBD results (40 min) on a branch that cannot conflict with the synaptic results produced on another machine.
 **Now:**
-- OBD grid ≈ 7.3 h/seed on CUDA (fitted, ±30%), 5 seeds default; retrain arm (5 criteria × 12 levels, `obd/experiments.py:19,25`) is 70–80% of every unit and runs on every cell (`obd/main.py:102`).
-- Synaptic grid ≈ 1.12 h/seed, 5 seeds (`synaptic_pruning/design.py:54-70`).
-- `--budget` skips units whose `CostModel` estimate exceeds the time left (`obd/main.py:154-186`, same in synaptic); `--status` prints time estimates, ≈ 2× high for OBD.
-- Both `aggregate.py` report a Wilcoxon/Holm p that can't reach 0.05 at ≤ 5 seeds (`obd/aggregate.py:126`, `synaptic_pruning/aggregate.py:109`).
-**Scope:** in: the brainstorm's recommended shape for both designs; OBD per-unit retrain arm; drop the pre-retrain train-split pass; budget runner rewrite (no estimates) in both `main.py`; drop Wilcoxon; delete `obd/results/units.jsonl` (99 pilot units; git keeps them). out: a large-scale point; the two-process GPU test; the full 7–8 h run; `dev/main.md` wording (user's file).
+- Both projects log to tracked files: `obd/results/units.jsonl` (fresh, 0/358 done) and `synaptic_pruning/results/runs.jsonl` (other machine). Different files, so result commits never touch each other.
+- Shared files that can conflict: `dev/agents/journal.md`, `dev/agents/DECISIONS.md`, `dev/agents/project/notes.md`, README.
+- This machine is a Mac (MPS, no CUDA); the 8 h pricing was for the RTX 5080 (assumption: this is where the OBD run happens).
+- Branch `obd-results` created from `main` at 234016c.
+**Scope:** in: branch, `main.py --budget 40` in `obd/`, commit `obd/results/units.jsonl` on the branch. out: code changes, synaptic runs, merging to main, pushing (SSH fails).
 **Constraints:**
-- "Modern scale" is read as *larger than the papers tested* (user); no design change for it.
-- No runtime estimates anywhere: remove both `CostModel`s and the estimate lines in `--status` (counts only).
-- `--budget MIN` runs in seed-major order and resumes from the log at unit granularity; a switch decides whether the unit in flight is cut off at the deadline or finishes. Assumption: cut off by default (the budget is a hard limit), `--finish` lets it complete; a cut-off unit is not logged and reruns next time.
-- Synaptic keeps its 84 runs (remaining keys unchanged). OBD starts a fresh `units.jsonl`.
-- Keep stored record fields unchanged except where the retrain arm shrinks (fewer criteria/levels).
+- Branch commits touch only `obd/results/units.jsonl` (plus this machine's journal at `/devlog`); no edits to shared code or docs, so merging later is a fast-forward of one file. Assumption.
+- Default design order (centre first, seed-major); hard cut-off at 40 min (D8), no `--finish`.
 **Approach:**
-- OBD `design.py`: weight decay (0, default, 1e-2); `scale` as a star (centre, width 0.5/2, data 0.1/0.3, epochs ⅓/3); retrain mults (0.5, 1, 4); drop mnist/resnet and mnist/vgg; new Unit field for the retrain criteria: all 5 at the centre point, (magnitude, saliency, saliency_layermean) on other default-weight-decay cells, none on non-default weight decay. Seeds per block: 3 for the grid, 5 for a `centre` block (centre points + paper net), run first.
-- OBD `experiments.py`: retrain visits keep (0.5, 0.25, 0.12, 0.05, 0.02, 0.01, 0.005); sweeps keep the 12 `FRACTIONS`; `pre_*` point evaluates val and test only.
-- Synaptic `design.py`: seq_len (14, 60); scale star per method with width × (none, dropout, pruning) crossed, data 0.1/0.3, epochs ×0.5/×3, plus `random_pruning` along width; sweep 6 pruning variants (paper, smin 0, smax 0.5/0.9, horizon 10, corner 0–0.9 h10); 4 seeds.
-- Both `main.py`: budget loop = deadline check between units, plus a timer (`signal.alarm` → same path as Ctrl-C) when cutting off; `--status` counts per block and seed.
-- Both `aggregate.py`: drop Wilcoxon/Holm; check `aggregate`/`figures` cope with retrain keep levels ≠ sweep levels and units with no retrain arm.
+- Run `cd obd && /Users/jackblackburn/code/main/obd/.venv/bin/python main.py --budget 40` in the background.
+- Check `--status`, commit the log on the branch with a message saying device and budget.
+- Merge later: `git checkout main && git merge obd-results` (journal may need a manual merge).
 **Risks:**
-- Aggregation assumes every unit has all 5 retrain criteria and the same keep grid → missing-key errors or silently empty tables; the smoke `--tables` run on the new design would show it.
-- Coarser retrain steps change the protocol; the tail Δ (keep ≤ 5%) might move vs the pilot. Noticed only by comparing the centre-block results with the pilot (git history).
-- Hard cut-off mid-CUDA-kernel could leave a partial JSON line if it hits during append; the alarm must be disarmed around `append_record`.
-- Budget fit is unverified until run; with no estimates, an overrun just leaves complete seeds.
+- MPS numerics and speed differ from CUDA; a log mixing both devices is not strictly comparable. Noticed from the device field in records; keep MPS and CUDA slices separate if it matters.
+- 40 min on a slower device may finish only the centre block's first seed or two.
+- The journal is edited on both machines; merge conflict there is likely, in results files it is not.
 **Done when:**
-- OBD `--status` lists per seed: the trimmed grid (≈ 122 units/seed, 3 seeds) and the `centre` block (5 seeds); synaptic ≈ 474 runs/seed, 4 seeds; no time estimates printed, no `CostModel` left.
-- `--smoke --budget 0.2` in each project stops at ≈ 12 s, cutting the unit in flight (nothing partial in the log); with `--finish` the in-flight unit completes and is logged; a rerun skips logged units and continues.
-- `--smoke` full runs complete on CUDA in both projects, and `--tables` / `--plot` run on the smoke logs without errors; tables have no p column.
-- OBD records: non-default-weight-decay units have no retrain arm; other grid units have 3 criteria at 7 levels; centre units 5; `pre_*` present without a train-split pass.
-- `obd/results/units.jsonl` deleted; `synaptic_pruning/results/runs.jsonl` keeps its 84 runs and `--status` counts the ones still in the design as done.
-- A one-off pricing of the v2 design with the brainstorm's fitted model (scratchpad, not repo) shows ≤ 8 h total; reported in the Close.
+- `git branch` shows `obd-results`; `main` is unchanged.
+- The run ends by itself at ≈ 40 min wall with no partial line in `obd/results/units.jsonl`; `--status` shows the units done.
+- The log is committed on `obd-results`; `git diff main --stat` shows only `obd/results/units.jsonl` (and the journal).
 **Open:**
-1. Cut-off default: hard stop at the deadline with `--finish` to complete the unit (assumed), or the reverse?
-2. D6 describes the estimate-based budget; after this lands, record the new budget rule with `/decide`?
-Decided: cut off by default (user); Open 1 closed.
+1. Is this Mac the right device for the run, or should it run on the RTX 5080? Assumed this Mac.
 
-### Progress · 14:45
-- Implemented as framed. OBD: `obd/design.py` (8 combos, 4 blocks incl. `centre`, `SEEDS` per block, `_retrain_criteria`), `obd/obd.py` (`Unit.retrain_criteria`), `obd/experiments.py` (`RETRAIN_FRACTIONS`, `_point(which=...)`), `obd/main.py` (timer budget, `--finish`, counts-only `--status`), `obd/aggregate.py`/`figures.py` (no Wilcoxon/Holm; heatmap `*` = CI excludes 0). Synaptic: `design.py` (seq 14/60, star scale + random_pruning on width, 6 sweep variants, `SEEDS = 4`), `main.py` (same runner), `aggregate.py` (no Wilcoxon; Friedman keeps Holm). README run section updated. Both `CostModel`s gone.
-- Deleted `obd/results/units.jsonl` and the stale tracked `obd/results/tables/*.csv`.
-- Verified (CUDA): `--status` OBD 358 units (114/seed × 3 + centre 8 × 2 extra seeds); synaptic 1896 runs (474/seed × 4), 36 of the 84 old runs still in the design and counted done. OBD `--smoke --budget 0.2` stopped at 13.9 s wall, 11 intact lines; 0.6 s budget on one cifar10/resnet unit: cut off (0 logged) vs `--finish` (1 logged); rerun skipped logged units (15 records, 15 keys). Full OBD smoke 164 units in 3.5 min; `--tables`/`--plot` ran; records have 0/3/5 retrain criteria at 7 levels as designed, no `pre_train_*`. Synaptic: 3000-epoch run cut at 3 s budget (0 logged) vs `--finish` (1 logged, 19 s); full smoke + `--tables`/`--plot` ran.
-- Pricing (scratchpad, pilot step times, brainstorm exponents, ±30%): OBD 4.8 h, synaptic 2.2 h (+64 unpriced) ≈ 6.9 h total.
-- Smoke outputs removed; the user's modified `obd/results/smoke.jsonl` restored as it was.
-- Trap: three OBD centre-point figures skip on smoke logs (`SMOKE` forces epochs=1, so nothing sits at epoch_mult 1); pre-existing.
+### Progress · 17:47
+- Run 1 (15:05, `--budget 40`): 19 units, unit 20 cut off at the deadline. Run 2 (16:10 → ~17:17, `--budget 67`, chained by a waiter script 10 min after run 1): 31 more units, unit 32 cut off. Both on MPS. Log: 50/358 units, all seed 0 (50/114), every line valid JSON.
+- Order was seed-major through all blocks, not centre-first: centre 4/40, core 29/198, scale 24/162, retrain 12/72.
+- Unit times on MPS: 0–10 min (fmnist/resnet ≈ 10 min, cifar10/vgg ≈ 5 min, mlp/paper ≈ 0–1 min).
+- Committed the log on `obd-results` only; `main` unchanged.
 
-## Close · 2026-09-30 14:43 · 8be767f..c4db8c8
-- **changed:** `obd/design.py`, `obd/experiments.py`, `obd/obd.py`: v2 design (8 combos; star `scale`; `centre` block at 5 seeds; `Unit.retrain_criteria` 5/3/0 by cell; 7 retrain levels; no pre-retrain train pass)
-- **changed:** `synaptic_pruning/design.py`: seq 14/60, star `scale` + `random_pruning` along width, 6 sweep variants, `SEEDS = 4`
-- **changed:** both `main.py`: `--budget` hard stop via SIGALRM, `--finish`, counts-only `--status`, `CostModel` removed; both `aggregate.py`: Wilcoxon/Holm column dropped; README run section
-- **changed:** deleted `obd/results/units.jsonl` (99-unit pilot) and stale `obd/results/tables/*.csv`; D8 recorded
-- **why:** whole suite must fit < 8 h on the RTX 5080 and still answer Q1–Q3; budgeting should be simple (user)
-- **verified:** `main.py --status` → OBD 358 units, synaptic 1896 runs (36 old runs counted); `--smoke --budget` cut-off vs `--finish` on both projects → 0 vs 1 unit logged, no partial lines; full `--smoke` + `--tables --plot` both projects → ran clean on CUDA; scratch pricing → ≈ 6.9 h (±30%)
+## Close · 2026-09-30 17:47 · 234016c..HEAD
+- **changed:** `obd/results/units.jsonl`: new, 50 OBD v2 units (seed 0) from MPS
+- **changed:** branch `obd-results` created from `main` (234016c); touches only the results file, so no conflict with synaptic's `runs.jsonl` on the other machine
+- **why:** collect a first slice of v2 OBD results without merge conflicts against the other machine's synaptic run
+- **verified:** `main.py --status` → 50/358 done; every line parses as JSON; no partial line after either cut-off; `git status` clean apart from the journal
 - **by:** claude
-- `c4db8c8` Rework both designs to fit the 8 h budget; hard-stop budget runner
-- 19 files, +185 −699
-- ⚠ uncommitted: `obd/results/smoke.jsonl` (user's earlier CUDA smoke output; tracked though git-ignored; restored unchanged)
+- 1 commit on `obd-results`
+- not merged, not pushed (SSH to GitHub fails here)
 
 ### Next
-1. `cd obd && ../.venv/bin/python main.py --design centre --budget 60` (≈ 0.6 h): 5 seeds at every centre point; measures seed noise of saliency − magnitude.
-2. From the centre results, per combo seeds needed ≈ (2.8 · SD / δ)²; confirm 3 OBD seeds suffice, and compare the retrain tail Δ (keep ≤ 5%) with the pilot (`8be767f:obd/results/units.jsonl`) to check the coarser retrain steps.
-3. Run the rest in slices: `main.py --budget N` in `obd/` then `synaptic_pruning/`.
-4. Optional: 10-min test of two concurrent processes (disjoint `--dataset`) for throughput; needs a lock or per-process log for the append.
-5. Carried: decide keep/delete `backup/laptop-main`.
+1. Decide whether MPS and CUDA results share one log (numerics and device differ); if not, run the rest on the RTX 5080 into a separate branch or file.
+2. To finish the centre block first: `cd obd && /Users/jackblackburn/code/main/obd/.venv/bin/python main.py --design centre --budget 60` (36 of 40 units left; ≈ 0.6 h was the CUDA estimate, MPS is slower).
+3. Continue slices with `main.py --budget N`; then the centre-seed-noise and retrain tail Δ checks from the previous Next.
+4. Merge: `git checkout main && git merge obd-results`; the journal is the file likely to conflict.
 ### Traps
-- SSH to GitHub fails here (`Permission denied (publickey)`).
-- Run from the project dir with `.venv/bin/python` by absolute path; `../.venv/bin/python` prints harmless `sys.prefix` RuntimeWarnings.
-- OBD centre-point figures (`retrain_curves`, `sweep_curves`, `overlap_curves`) skip on smoke logs: `SMOKE` forces epochs=1, so no unit sits at epoch_mult 1.
-- Synaptic smoke runs are ~10 ms; to test the budget cut-off use `--set epochs=3000`.
-- Adding a Unit field changes every key (why OBD v2 has a fresh log).
+- This Mac is MPS only (no CUDA); the 8 h pricing was for the RTX 5080.
+- Default `main.py --budget N` is not centre-first; pass `--design centre` for that.
+- A unit cut off at the deadline is not logged and reruns first next session.
+- Run from `obd/` with `/Users/jackblackburn/code/main/obd/.venv/bin/python` by absolute path.
 ### Pointers
-- `obd/design.py` `_retrain_criteria`, `SEEDS`; `obd/main.py` `run` (timer), `OutOfBudget`
-- `synaptic_pruning/design.py` `block_units`
-- `dev/agents/DECISIONS.md` D8; `dev/agents/project/notes.md` "Budget"
-- `dev/brainstorm/experiment-alignment-and-run-length/index.md`
+- `obd/main.py` `run` (timer budget); `obd/design.py` `SEEDS`; `dev/agents/DECISIONS.md` D8
