@@ -1,20 +1,12 @@
 # Durable notes
 - MPS (Mac): `vmap(jacrev)` through BatchNorm hard-aborts the process (Metal assertion, not catchable); `obd.diagonal_hessian` sends BN models to CPU on MPS (`_cpu_hessian`). VGG hits a catchable adaptive-pool error and falls back too. CUDA path untouched, unverified.
-- `--budget` is checked only before a unit starts, so a run overruns by up to one unit (ResNet/CIFAR units take 6-21 min on the M4 Max).
+- `--budget` is a hard stop: a SIGALRM timer cuts off the unit in flight at the deadline (not logged, reruns next time); `--finish` lets it complete. No runtime estimates anywhere (user, 2026-09-30).
 - M4 Max (MPS) unit times: MLP/paper/VGG small 8-90 s; fmnist ResNet 6 min; cifar10 VGG w2 6 min; cifar10 ResNet w1 full 21 min. Estimated full OBD grid on the Mac ~276 h, so run the ResNet/CIFAR units on the RTX 5080.
 - Backgrounded shell jobs ignore SIGINT (use `kill`); macOS has no `timeout`; zsh does not word-split `$VAR` (use `${=var}`).
-- Log files hold per-device results: `obd/results/units.jsonl` mixes Mac (MPS) and later GPU runs by unit key.
+- The 99-unit OBD pilot log (Mac + CUDA, seed 0, 12-level retrain on every cell) was deleted 2026-09-30; it is in git at `8be767f:obd/results/units.jsonl`. `units.jsonl` starts fresh with the v2 design.
 
 ## Budget: whole suite (OBD + synaptic) must run in < 8 h on the RTX 5080 (user, 2026-09-30)
-- Now: OBD full grid ≈ 81 h remaining at CUDA speed (1731 of 1830 units, 5 seeds; ≈ 20 h per seed). Synaptic: 5760 runs; a 5 min run did 84 runs (median 1.4 s lstm, 1.7 s cnn, 3.2 s transformer, mean 6 s, max 40 s), so the full grid ≈ 5.5 h (+120 runs unestimated; estimate from 84 shuffled seed-0 runs, transformer at ep60 dominates the tail). Aim ≈ 4 h each; OBD needs a ~15× cut per seed, so fewer seeds alone will not do it.
 - Where OBD time goes (99 units, mixed Mac/GPU): cifar10/resnet, cifar10/vgg and fmnist/resnet are ~80% of unit time (median 2.5–3.3 min, up to 20 min); the six other combos are 8–50 s. Cut there first. Within a unit (CUDA, `step_durations_s`): the 5 retrain arms are 70–80%, base training 10–15%, sweeps 10–20%, overlap < 1%; the saliency arms cost within 10% of magnitude (the Hessian is cheap).
-- OBD `--status` overestimates: ≈ 17 h/seed vs ≈ 7.3 h/seed from a per-step log-linear fit on the 85 CUDA units. `design.CostModel` pools the 14 MPS units into its medians and scales the whole unit with epochs, though retraining does not depend on training epochs.
-- Shrink without weakening conclusions:
-  1. Pair, don't replicate: OBD compares saliency vs magnitude on the same trained net, so effects are paired within a unit and 3 seeds is enough. Keep 5 seeds only for the centre point and the headline (cifar10/resnet).
-  2. Star design instead of full crosses in `scale`: centre + one-factor-at-a-time (data 0.1 / 1, epochs 1/3 / 3, width 0.5 / 2) = 5–7 cells instead of 27 (OBD) or 27×3 methods (synaptic). Keep the full cross only for the one interaction a research question needs (synaptic: width × method for "does benefit continue at scale").
-  3. Tier the combos: light combos (mnist*, fmnist/mlp, fmnist/vgg, cifar10/mlp) keep the full `core` grid; heavy ones (cifar10/resnet, cifar10/vgg, fmnist/resnet) get centre + width + one weight-decay contrast only. Drop redundant combos (mnist/resnet, mnist/vgg) or keep them at 1 seed.
-  4. Cut levels of factors with a flat response: weight decay 4 → 3 (0, 1e-4, 1e-2), retrain multiples 4 → 3 or run `retrain` on 3 combos only. Check seed-0 `--tables` (effects.csv) first and drop factors with negligible effect.
-  5. Synaptic: `sweep` smin × smax × horizon (12 pruning variants) → 5–6 (fractional; keep the paper's setting and the corners); `core` seq_len 3 → 2 (14, 60); keep `none`, `pruning`, `dropout` as the scale methods, run `mc_dropout`, `oneshot`, `narrow` and `random_pruning` in `core` only (they are controls); keep the `random_pruning` control.
-  6. Cost per unit: cut the retrain arm (criteria 5 → 3, levels 12 → 7), not Hessian samples. Priced plans: `dev/brainstorm/experiment-alignment-and-run-length/`.
-  7. Run order: seed 0 of the trimmed design first, look at the tables, then decide seeds 1–2; extra seeds only where the seed-0 interval straddles zero.
-- Editing `design.py` blocks or constants changes unit keys only for units that change; already-finished units with identical keys stay done. Do not change unit fields.
+- v2 designs (2026-09-30) price at OBD ≈ 1.5 h/seed × 3 + centre 0.16 h × 2 extra seeds ≈ 4.8 h, synaptic ≈ 0.54 h/seed × 4 ≈ 2.2 h (+64 unpriced runs); ±30%, from pilot step times with the brainstorm's exponents.
+- The shrink plan (star scale blocks, trimmed retrain arm, fewer weight-decay/retrain levels, 3/5 OBD seeds, 4 synaptic seeds) is implemented as the v2 designs; reasoning in `dev/brainstorm/experiment-alignment-and-run-length/`.
+- Editing `design.py` blocks or constants changes unit keys only for units that change; already-finished units with identical keys stay done. Adding or removing a Unit field changes every key (v2 added OBD `retrain_criteria`, hence the fresh log).
