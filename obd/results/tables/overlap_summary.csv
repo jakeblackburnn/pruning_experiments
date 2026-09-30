@@ -1,0 +1,2 @@
+dataset,arch,width,data_frac,epochs,weight_decay,retrain_epochs,spearman,spearman_ci,kendall_subsample,kendall_subsample_ci,pearson_log,pearson_log_ci,var_log_h,var_log_h_ci,var_log_w,var_log_w_ci,cov_log_h_log_w,cov_log_h_log_w_ci,between_layer_frac,between_layer_frac_ci,n
+fmnist,mlp,0.5,0.1,10,0.0001,2,0.8330189071955386,,0.6622400922081094,,0.8465464970212141,,2.0164324945992127,,1.198751653145364,,0.07233323926494847,,0.10341429547246066,,1

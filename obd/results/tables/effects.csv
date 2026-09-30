@@ -1,0 +1,2 @@
+factor,levels,eta_sq,outcome
+keep,13.0,1.0,retrain test_acc: saliency - magnitude
