@@ -11,3 +11,10 @@
 - Measured: synaptic v2 full run (1896 runs, 4 seeds) took 2.03 h summed `duration_s` on the RTX 5080 (2026-09-30), inside the priced 2.2 h. OBD v2 still unmeasured.
 - The shrink plan (star scale blocks, trimmed retrain arm, fewer weight-decay/retrain levels, 3/5 OBD seeds, 4 synaptic seeds) is implemented as the v2 designs; reasoning in `dev/brainstorm/experiment-alignment-and-run-length/`.
 - Editing `design.py` blocks or constants changes unit keys only for units that change; already-finished units with identical keys stay done. Adding or removing a Unit field changes every key (v2 added OBD `retrain_criteria`, hence the fresh log).
+
+## Analysis (2026-10-02)
+- No `.venv` on the PC: use `~/Code/python_venv_01_main/bin/python`.
+- `.gitignore` `results/tables/` and `results/smoke*.jsonl` are anchored to the repo root (a slash in the middle anchors a pattern), so `obd/results/tables/` and `synaptic_pruning/results/tables/` show as untracked. Don't commit them.
+- `aggregate.load` reads every line of the log; `--status` counts only units in the current design. `runs.jsonl` has 48 seed-0 runs outside the design (seq_len 1, stray scale cells, one `pruning:0-0.5:h10`), so `--tables --plot` includes them.
+- The CNN forecaster is worse than last-value persistence on air_quality and etth1 (skill −0.45, −1.57) and swamps arch-averaged synaptic numbers. Report with and without it.
+- OBD retrain curves have no unpruned-plus-retraining control: `keep=1.0` is the base net with no extra epochs.
